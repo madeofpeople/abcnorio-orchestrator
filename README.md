@@ -6,6 +6,9 @@ Orchestrates Astro static site deployments across three environments (dev, stagi
 
 ```
 deploy-orchestrator/
+├── scripts/
+│   ├── backup-build.sh
+│   └── deploy.sh
 ├── index.mjs           # Main: HTTP server, worker setup, trigger routing
 ├── status.mjs          # Status: loadStatus, saveStatus, mark* functions
 ├── files.mjs           # File operations: archive listing, cleanup, script execution
@@ -31,7 +34,7 @@ deploy-orchestrator/
 - Backup tracking: `latestBackup`, `backups[]` (tracks created zips)
 - Schema normalization and validation
 
-#### ***files.mjs**
+#### **files.mjs**
 - Archive discovery: `listArchivesForTarget(target)`
 - Cleanup: `cleanupOldArchives(target, maxKeep)` — removes old zips when limit exceeded
 - Script execution: `runCommand(command, args)` — spawns bash with inherit stdio
@@ -85,9 +88,9 @@ Job received: deploy-staging
        ↓
 markStarted(target) → status file: lastStartedAt, lastStatus='running'
        ↓
-runCommand('bash', ['/astro-site/deploy-to-staging.sh'])
-  - Sets: MODE=development, BACKUP_TARGET=staging, BACKUP_SOURCE_DIR=/shared/static/staging
-  - Runs: npm install → backup previous build → npm run build:site
+runCommand('bash', ['/orchestrator/scripts/deploy.sh', 'staging'])
+  - Sets: MODE=staging, BACKUP_TARGET=staging, BACKUP_SOURCE_DIR=/shared/static/staging
+       - Runs: npm install → /orchestrator/scripts/backup-build.sh → npm run build:site
   - Output: dist/ artifacts copied to /shared/static/staging
        ↓
 If exit code 0:
@@ -133,6 +136,13 @@ curl -X POST http://localhost:4011/trigger \
 
 # Response:
 # {"status":"queued","target":"staging","source":"manual"}
+```
+
+### Run Deploy Script Directly
+
+```bash
+# Run deployment script directly (inside deploy-orchestrator container)
+docker exec deploy-orchestrator sh -lc "bash /orchestrator/scripts/deploy.sh staging"
 ```
 
 ### Check Status

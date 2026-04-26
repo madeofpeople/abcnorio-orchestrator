@@ -18,13 +18,15 @@ const MAX_BACKUPS = Number(process.env.MAX_BACKUPS || 12);
 
 const DEBOUNCE_MS = Math.max(0, DEBOUNCE_SECONDS) * 1000;
 const WORKDIR = process.env.ASTRO_SITE_ROOT || '/astro-site';
+const SCRIPT_ROOT = process.env.ORCHESTRATOR_SCRIPT_ROOT || '/orchestrator/scripts';
 const ARCHIVE_DIR = path.resolve(WORKDIR, 'build-archives');
 const FOLLOWUP_KEY_PREFIX = 'build:astro:followup';
 
-const COMMANDS = {
-  dev: [path.join(WORKDIR, 'deploy-to-dev.sh'), process.env.DEV_BUILD_PATH || ''],
-  staging: [path.join(WORKDIR, 'deploy-to-staging.sh'), process.env.STAGING_BUILD_PATH || ''],
-  production: [path.join(WORKDIR, 'deploy-to-production.sh'), process.env.PRODUCTION_BUILD_PATH || ''],
+const DEPLOY_SCRIPT = path.join(SCRIPT_ROOT, 'deploy.sh');
+const TARGETS = {
+  dev: process.env.DEV_BUILD_PATH || '',
+  staging: process.env.STAGING_BUILD_PATH || '',
+  production: process.env.PRODUCTION_BUILD_PATH || '',
 };
 
 /** @type {{ status: 'idle'|'running'|'done'|'failed', target: string|null, started: number|null, finished: number|null, exitCode: number|null, message: string|null }} */
@@ -91,11 +93,11 @@ const worker = new Worker(
 
     console.log(`[worker] received job ${job.id} for target=${target}`);
 
-    if (!COMMANDS[target]) {
+    if (!TARGETS[target]) {
       throw new Error(`invalid target: ${target}`);
     }
 
-    const [scriptPath, deployBuildPath] = COMMANDS[target];
+    const deployBuildPath = TARGETS[target];
     const resolvedDeployPath = assertDeployPath(target, deployBuildPath);
 
     state = {
@@ -107,10 +109,10 @@ const worker = new Worker(
       message: null,
     };
     markStarted(target);
-    console.log(`[worker] ${target} marked as running, executing ${scriptPath}`);
+    console.log(`[worker] ${target} marked as running, executing ${DEPLOY_SCRIPT}`);
 
     const archiveBefore = new Set(listArchivesForTarget(target));
-    const exitCode = await runCommand('bash', [scriptPath]);
+    const exitCode = await runCommand('bash', [DEPLOY_SCRIPT, target]);
     console.log(`[worker] ${target} script exited with code ${exitCode}`);
 
     if (exitCode !== 0) {
@@ -233,8 +235,8 @@ const server = http.createServer(async (req, res) => {
     const target = String(body.target || '').trim();
     const source = String(body.source || 'manual').trim();
 
-    if (!COMMANDS[target]) {
-      return respond(400, { error: 'invalid target', valid: Object.keys(COMMANDS) });
+    if (!TARGETS[target]) {
+      return respond(400, { error: 'invalid target', valid: Object.keys(TARGETS) });
     }
 
     if (source === 'save' && !SAVE_TRIGGER_ENABLED) {
