@@ -3,7 +3,14 @@ import path from 'node:path';
 import { Queue, Worker } from 'bullmq';
 import IORedis from 'ioredis';
 import { getAuthToken, readJsonBody } from './http.mjs';
-import { listArchivesForTarget, runCommand, assertDeployPath, cleanupOldArchives } from './files.mjs';
+import {
+  listArchivesForTarget,
+  runCommand,
+  assertDeployPath,
+  cleanupOldArchives,
+  resolveArchiveForTarget,
+  restoreArchiveToTarget,
+} from './files.mjs';
 import {
   loadStatus, saveStatus, markRequested, markStarted, markDone, markFailed, updateStatus,
 } from './status.mjs';
@@ -42,12 +49,26 @@ let state = {
 const redis = new IORedis(REDIS_URL, { maxRetriesPerRequest: null });
 const queue = new Queue(QUEUE_NAME, { connection: redis });
 
+function normalizeScope(scope) {
+  const candidate = String(scope || 'full').trim().toLowerCase();
+  if (candidate === 'full') {
+    return 'full';
+  }
+
+  if (/^[a-z0-9][a-z0-9_-]*$/.test(candidate)) {
+    return candidate;
+  }
+
+  return 'full';
+}
+
 function followupKey(target) {
   return `${FOLLOWUP_KEY_PREFIX}:${target}`;
 }
 
-async function enqueueTarget(target, source = 'manual') {
+async function enqueueTarget(target, source = 'manual', scope = 'full') {
   const jobId = `deploy-${target}`;
+  const normalizedScope = normalizeScope(scope);
   const existing = await queue.getJob(jobId);
 
   if (state.status === 'running' && state.target === target) {
@@ -73,14 +94,14 @@ async function enqueueTarget(target, source = 'manual') {
   }
 
   const delay = source === 'save' ? DEBOUNCE_MS : 0;
-  const job = await queue.add('deploy', { target, source }, {
+  const job = await queue.add('deploy', { target, source, scope: normalizedScope }, {
     jobId,
     delay,
     removeOnComplete: true,
     removeOnFail: 50,
   });
 
-  console.log(`[enqueue] added job ${jobId} (source=${source}, delay=${delay}ms)`);
+  console.log(`[enqueue] added job ${jobId} (source=${source}, scope=${normalizedScope}, delay=${delay}ms)`);
   markRequested(target);
 
   return { accepted: true, followup: false };
@@ -90,8 +111,9 @@ const worker = new Worker(
   QUEUE_NAME,
   async (job) => {
     const { target } = job.data;
+    const scope = normalizeScope(job.data.scope);
 
-    console.log(`[worker] received job ${job.id} for target=${target}`);
+    console.log(`[worker] received job ${job.id} for target=${target} scope=${scope}`);
 
     if (!TARGETS[target]) {
       throw new Error(`invalid target: ${target}`);
@@ -112,7 +134,7 @@ const worker = new Worker(
     console.log(`[worker] ${target} marked as running, executing ${DEPLOY_SCRIPT}`);
 
     const archiveBefore = new Set(listArchivesForTarget(target));
-    const exitCode = await runCommand('bash', [DEPLOY_SCRIPT, target]);
+    const exitCode = await runCommand('bash', [DEPLOY_SCRIPT, target, scope]);
     console.log(`[worker] ${target} script exited with code ${exitCode}`);
 
     if (exitCode !== 0) {
@@ -159,7 +181,7 @@ const worker = new Worker(
     if (needsFollowup) {
       console.log(`[worker] queueing followup job for ${target}`);
       await redis.del(fk);
-      await queue.add('deploy', { target, source: 'followup' }, {
+      await queue.add('deploy', { target, source: 'followup', scope }, {
         jobId: `deploy_${target}`,
         delay: DEBOUNCE_MS,
         removeOnComplete: true,
@@ -234,6 +256,7 @@ const server = http.createServer(async (req, res) => {
 
     const target = String(body.target || '').trim();
     const source = String(body.source || 'manual').trim();
+    const scope = normalizeScope(String(body.scope || 'full').trim());
 
     if (!TARGETS[target]) {
       return respond(400, { error: 'invalid target', valid: Object.keys(TARGETS) });
@@ -248,10 +271,48 @@ const server = http.createServer(async (req, res) => {
     }
 
     try {
-      const result = await enqueueTarget(target, source);
-      return respond(202, { status: result.followup ? 'queued_followup' : 'queued', target, source });
+      const result = await enqueueTarget(target, source, scope);
+      return respond(202, {
+        status: result.followup ? 'queued_followup' : 'queued',
+        target,
+        source,
+        scope,
+      });
     } catch (error) {
       return respond(500, { error: 'trigger failed', message: error instanceof Error ? error.message : 'unknown error' });
+    }
+  }
+
+  if (req.method === 'POST' && req.url === '/restore') {
+    let body = {};
+    try {
+      body = await readJsonBody(req);
+    } catch {
+      return respond(400, { error: 'invalid json' });
+    }
+
+    const target = String(body.target || '').trim();
+    const file = String(body.file || '').trim();
+
+    if (!TARGETS[target]) {
+      return respond(400, { error: 'invalid target', valid: Object.keys(TARGETS) });
+    }
+
+    try {
+      const archivePath = resolveArchiveForTarget(target, file);
+      const deployBuildPath = TARGETS[target];
+      const restoredPath = await restoreArchiveToTarget(target, archivePath, deployBuildPath);
+      updateStatus('deploy', target, { deployBuildPath: restoredPath });
+      return respond(200, {
+        status: 'restored',
+        target,
+        file,
+      });
+    } catch (error) {
+      return respond(400, {
+        error: 'restore failed',
+        message: error instanceof Error ? error.message : 'unknown error',
+      });
     }
   }
 

@@ -4,6 +4,14 @@ set -e
 umask 0002
 
 TARGET="${1:-}"
+SCOPE="${2:-full}"
+
+if [[ "$SCOPE" != "full" && "$SCOPE" != "events" ]]; then
+  if [[ ! "$SCOPE" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
+    echo "Invalid scope: $SCOPE"
+    exit 1
+  fi
+fi
 
 case "$TARGET" in
   dev)
@@ -24,19 +32,30 @@ case "$TARGET" in
     ;;
 esac
 
-echo "${HOME} Deploying Astro in ${MODE} mode... at ${BUILD_PATH}"
+echo "${HOME} Deploying Astro in ${MODE} mode (scope=${SCOPE})... at ${BUILD_PATH}"
 
 if [ -n "${BUILD_PATH}" ] && [ -d "${BUILD_PATH}" ]; then
     npm install
     rm -rf ./dist
     export MODE
+    export SCOPE
     export BACKUP_TARGET="${TARGET}"
     export BACKUP_SOURCE_DIR="${BUILD_PATH}"
     export ASTRO_BUILD_BACKUP=1
     bash "${ORCHESTRATOR_SCRIPT_ROOT:-/orchestrator/scripts}/backup-build.sh"
     npm run build:site
-    find "${BUILD_PATH}" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
-    cp -R ./dist/. "${BUILD_PATH}/"
+
+    if [[ "$SCOPE" != "full" ]]; then
+      if [[ -d "./dist/${SCOPE}" ]]; then
+        rm -rf "${BUILD_PATH}/${SCOPE}"
+        cp -R "./dist/${SCOPE}" "${BUILD_PATH}/${SCOPE}"
+      else
+        echo "Scoped output ./dist/${SCOPE} not found; skipping segmented copy."
+      fi
+    else
+      find "${BUILD_PATH}" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+      cp -R ./dist/. "${BUILD_PATH}/"
+    fi
 else
     echo "Build path not set or missing for target=${TARGET}. Skipping Astro build."
 fi
