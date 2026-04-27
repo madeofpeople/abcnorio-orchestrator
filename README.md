@@ -130,7 +130,7 @@ Extract: envs.staging.currentBuild.hasBuild, lastFinishedAt, lastStatus
 
 ```bash
 curl -X POST http://localhost:4011/trigger \
-  -H "Authorization: Bearer Ebulient\ Hippopotami\ Bounce\ Pleasantly" \
+       -H "Authorization: Bearer $ASTRO_BUILD_TRIGGER_SECRET" \
   -H "Content-Type: application/json" \
   -d '{"target":"staging","source":"manual"}'
 
@@ -149,17 +149,23 @@ docker exec deploy-orchestrator sh -lc "bash /orchestrator/scripts/deploy.sh sta
 
 ```bash
 curl http://localhost:4011/status \
-  -H "Authorization: Bearer Ebulient\ Hippopotami\ Bounce\ Pleasantly"
+       -H "Authorization: Bearer $ASTRO_BUILD_TRIGGER_SECRET"
 
 # Response:
 # {"status":"running","target":"staging","started":1777207930000,...}
+```
+
+### Follow Build Progress
+
+```bash
+watch -n 1 'curl -s http://localhost:4011/status -H "Authorization: Bearer $ASTRO_BUILD_TRIGGER_SECRET" | python3 -m json.tool'
 ```
 
 ### Check Health
 
 ```bash
 curl http://localhost:4011/health \
-  -H "Authorization: Bearer Ebulient\ Hippopotami\ Bounce\ Pleasantly"
+       -H "Authorization: Bearer $ASTRO_BUILD_TRIGGER_SECRET"
 
 # Response: {"status":"ok"}
 ```
