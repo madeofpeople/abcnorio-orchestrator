@@ -20,7 +20,7 @@ const SECRET = process.env.ASTRO_BUILD_TRIGGER_SECRET || '';
 const REDIS_URL = process.env.REDIS_URL || 'redis://redis:6379';
 const QUEUE_NAME = process.env.BUILD_QUEUE_NAME || 'astro-build';
 const DEBOUNCE_SECONDS = Number(process.env.BUILD_DEBOUNCE_SECONDS || 120);
-const SAVE_TRIGGER_ENABLED = process.env.WP_SAVE_TRIGGER_QUEUE_ENABLED === '1';
+const ALLOW_MANUAL_TRIGGER = process.env.ORCHESTRATOR_ALLOW_MANUAL_TRIGGER !== '0';
 const MAX_BACKUPS = Number(process.env.MAX_BACKUPS || 12);
 
 const DEBOUNCE_MS = Math.max(0, DEBOUNCE_SECONDS) * 1000;
@@ -262,8 +262,8 @@ const server = http.createServer(async (req, res) => {
       return respond(400, { error: 'invalid target', valid: Object.keys(TARGETS) });
     }
 
-    if (source === 'save' && !SAVE_TRIGGER_ENABLED) {
-      return respond(202, { status: 'ignored', reason: 'save trigger disabled', target });
+    if (source === 'manual' && !ALLOW_MANUAL_TRIGGER) {
+      return respond(403, { error: 'manual trigger is disabled' });
     }
 
     if (source === 'save' && target === 'production') {

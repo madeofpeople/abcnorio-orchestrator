@@ -179,7 +179,7 @@ curl http://localhost:4011/health \
 | `REDIS_URL` | redis://redis:6379 | BullMQ queue backend |
 | `BUILD_QUEUE_NAME` | astro-build | BullMQ queue name |
 | `BUILD_DEBOUNCE_SECONDS` | 120 | Delay for save-triggered builds |
-| `WP_SAVE_TRIGGER_QUEUE_ENABLED` | 0 | Allow save-triggered builds (set to '1') |
+| `ORCHESTRATOR_ALLOW_MANUAL_TRIGGER` | 1 | Allow `source=manual` calls to `/trigger` |
 | `MAX_BACKUPS` | 12 | Archive cleanup threshold |
 | `DEV_BUILD_PATH` | (none) | Output path for dev builds |
 | `STAGING_BUILD_PATH` | (none) | Output path for staging builds |
@@ -188,6 +188,8 @@ curl http://localhost:4011/health \
 | `ASTRO_DEPLOYMENT_STATUS_FILE` | (none) | Override status file path |
 
 ### Example Docker Exec
+
+Note: manual trigger examples require `ORCHESTRATOR_ALLOW_MANUAL_TRIGGER=1`.
 
 ```bash
 # Trigger staging build
