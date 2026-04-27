@@ -19,15 +19,12 @@ const PORT = Number(process.env.ORCHESTRATOR_PORT || 4011);
 const SECRET = process.env.ASTRO_BUILD_TRIGGER_SECRET || '';
 const REDIS_URL = process.env.REDIS_URL || 'redis://redis:6379';
 const QUEUE_NAME = process.env.BUILD_QUEUE_NAME || 'astro-build';
-const DEBOUNCE_SECONDS = Number(process.env.BUILD_DEBOUNCE_SECONDS || 120);
 const ALLOW_MANUAL_TRIGGER = process.env.ORCHESTRATOR_ALLOW_MANUAL_TRIGGER !== '0';
 const MAX_BACKUPS = Number(process.env.MAX_BACKUPS || 12);
 
-const DEBOUNCE_MS = Math.max(0, DEBOUNCE_SECONDS) * 1000;
 const WORKDIR = process.env.ASTRO_SITE_ROOT || '/astro-site';
 const SCRIPT_ROOT = process.env.ORCHESTRATOR_SCRIPT_ROOT || '/orchestrator/scripts';
 const ARCHIVE_DIR = path.resolve(WORKDIR, 'build-archives');
-const FOLLOWUP_KEY_PREFIX = 'build:astro:followup';
 
 const DEPLOY_SCRIPT = path.join(SCRIPT_ROOT, 'deploy.sh');
 const TARGETS = {
@@ -62,49 +59,23 @@ function normalizeScope(scope) {
   return 'full';
 }
 
-function followupKey(target) {
-  return `${FOLLOWUP_KEY_PREFIX}:${target}`;
-}
-
 async function enqueueTarget(target, source = 'manual', scope = 'full') {
-  const jobId = `deploy-${target}`;
   const normalizedScope = normalizeScope(scope);
-  const existing = await queue.getJob(jobId);
+  const dedupId = `deploy-${target}`;
 
-  if (state.status === 'running' && state.target === target) {
-    console.log(`[enqueue] ${target} already running, queuing followup`);
-    await redis.set(followupKey(target), '1');
-    markRequested(target);
-    return { accepted: true, followup: true };
-  }
-
-  if (existing) {
-    const existingState = await existing.getState();
-    console.log(`[enqueue] ${target} job exists in state: ${existingState}`);
-    if (existingState === 'active') {
-      await redis.set(followupKey(target), '1');
-      markRequested(target);
-      return { accepted: true, followup: true };
-    }
-
-    if (['waiting', 'delayed', 'prioritized', 'failed', 'completed'].includes(existingState)) {
-      console.log(`[enqueue] removing existing ${existingState} job for ${target}`);
-      await existing.remove();
-    }
-  }
-
-  const delay = source === 'save' ? DEBOUNCE_MS : 0;
-  const job = await queue.add('deploy', { target, source, scope: normalizedScope }, {
-    jobId,
-    delay,
+  await queue.add('deploy', { target, source, scope: normalizedScope }, {
+    deduplication: {
+      id: dedupId,
+      keepLastIfActive: true,
+    },
     removeOnComplete: true,
     removeOnFail: 50,
   });
 
-  console.log(`[enqueue] added job ${jobId} (source=${source}, scope=${normalizedScope}, delay=${delay}ms)`);
+  console.log(`[enqueue] trigger accepted for ${target} (source=${source}, scope=${normalizedScope}, dedup=${dedupId})`);
   markRequested(target);
 
-  return { accepted: true, followup: false };
+  return { accepted: true };
 }
 
 const worker = new Worker(
@@ -175,19 +146,6 @@ const worker = new Worker(
     };
     markDone(target);
     console.log(`[worker] ${target} deployment completed successfully`);
-
-    const fk = followupKey(target);
-    const needsFollowup = (await redis.get(fk)) === '1';
-    if (needsFollowup) {
-      console.log(`[worker] queueing followup job for ${target}`);
-      await redis.del(fk);
-      await queue.add('deploy', { target, source: 'followup', scope }, {
-        jobId: `deploy_${target}`,
-        delay: DEBOUNCE_MS,
-        removeOnComplete: true,
-        removeOnFail: 50,
-      });
-    }
   },
   {
     connection: redis,
@@ -198,10 +156,6 @@ const worker = new Worker(
 worker.on('failed', async (job, error) => {
   const target = job?.data?.target || state.target;
   console.log(`[worker:failed] job ${job?.id} target=${target}: ${error?.message}`);
-  const fk = target ? followupKey(target) : '';
-  if (fk) {
-    await redis.del(fk);
-  }
 
   if (state.status !== 'failed') {
     state = {
@@ -271,9 +225,9 @@ const server = http.createServer(async (req, res) => {
     }
 
     try {
-      const result = await enqueueTarget(target, source, scope);
+      await enqueueTarget(target, source, scope);
       return respond(202, {
-        status: result.followup ? 'queued_followup' : 'queued',
+        status: 'queued',
         target,
         source,
         scope,

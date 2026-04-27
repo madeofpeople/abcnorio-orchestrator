@@ -24,7 +24,7 @@ deploy-orchestrator/
 - Routes: `POST /trigger`, `GET /status`, `GET /health`
 - Auth via Bearer token (`ASTRO_BUILD_TRIGGER_SECRET`)
 - BullMQ Worker instance (concurrency=1, serialized execution)
-- Job enqueueing logic with state tracking
+- Job enqueueing logic with native BullMQ deduplication [`keepLastIfActive`](https://github.com/taskforcesh/bullmq/compare/v5.71.1...v5.72.0)
 - Event handlers for job completion/failure
 
 #### **status.mjs**
@@ -56,27 +56,25 @@ POST /trigger with {target: 'staging', source: 'save'}
        ↓
 Orchestrator validates auth + target
        ↓
-enqueueTarget() checks for existing job
+enqueueTarget() adds BullMQ job with deduplication id deploy-<target>
 ```
 
 ### 2. Enqueue (Orchestrator → Redis)
 
 ```
-If already running for target:
-  Set Redis key: build:astro:followup:staging = "1"
-  Return 202 (queued_followup)
-       ↓
-Else if old job in failed/completed state:
-  Remove it from Redis queue
-       ↓
-Add new job to queue:
-  queue.add('deploy', {target, source}, {jobId: 'deploy-staging', delay, ...})
-  Return 202 (queued)
+Add job using BullMQ deduplication:
+       queue.add('deploy', {target, source, scope}, {
+              deduplication: { id: 'deploy-staging', keepLastIfActive: true }
+       })
+                      ↓
+Behavior for same target dedup id:
+       - If active: keep latest trigger payload, enqueue one follow-up automatically
+       - If multiple triggers arrive while active: latest payload wins
+       - No parallel runs for same dedup id
 ```
 
 **Redis writes:**
 - `bull:astro-build:*` keys: Job data, state, metadata
-- `build:astro:followup:staging` (optional): Marker if concurrent trigger received
 - Status file also written to disk via status.mjs
 
 ### 3. Worker Processing (Redis → Orchestrator → Scripts)
@@ -106,9 +104,7 @@ Else if exit code != 0:
 ```
 
 **Redis operations during worker processing:**
-- Read: Current job state, check for followup flag
 - Write: Job status transitions (active → completed/failed)
-- Delete: Followup flag if present
 - Event: Emit 'completed' or 'failed' event
 
 ### 4. Status Check (Client → Orchestrator → Status File)
@@ -178,7 +174,6 @@ curl http://localhost:4011/health \
 | `ASTRO_BUILD_TRIGGER_SECRET` | (none) | Bearer token for auth |
 | `REDIS_URL` | redis://redis:6379 | BullMQ queue backend |
 | `BUILD_QUEUE_NAME` | astro-build | BullMQ queue name |
-| `BUILD_DEBOUNCE_SECONDS` | 120 | Delay for save-triggered builds |
 | `ORCHESTRATOR_ALLOW_MANUAL_TRIGGER` | 1 | Allow `source=manual` calls to `/trigger` |
 | `MAX_BACKUPS` | 12 | Archive cleanup threshold |
 | `DEV_BUILD_PATH` | (none) | Output path for dev builds |
@@ -276,8 +271,8 @@ KEYS "bull:astro-build:*"
 # Get job details
 HGETALL "bull:astro-build:deploy-staging"
 
-# Check followup flag
-GET "build:astro:followup:staging"
+# Check active queue keys
+KEYS "bull:astro-build:*"
 ```
 
 ## Troubleshooting
