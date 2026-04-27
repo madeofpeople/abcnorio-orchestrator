@@ -194,116 +194,36 @@ docker exec deploy-orchestrator sh -c "curl -s -X POST http://localhost:4011/tri
 docker logs -f deploy-orchestrator
 ```
 
-## Edge Cases & Caveats
+## Testing
 
-### 1. Production Save-Trigger Disabled
+Run tests from the orchestrator root:
 
-**Caveat:** `source:'save'` with `target:'production'` returns 403 Forbidden.
+```bash
+npm test
+```
 
-**Why:** Prevents accidental deploys to production from WordPress saves. Only manual triggers (via dashboard or API) are allowed.
+Current suite uses (`node --test`) and focuses on helper-level checks in `test/files.test.mjs`:
 
-**Workaround:** Use `source:'manual'` or wire a separate approval workflow before triggering.
+- archive listing (`listArchivesForTarget`)
+- archive validation (`resolveArchiveForTarget`)
+       - valid target-prefix acceptance
+       - traversal/path-like rejection
+       - missing archive rejection
+- deploy path validation (`assertDeployPath`)
 
-### 2. Failed Jobs Don't Auto-Retry
-
-**Caveat:** If a deploy script exits non-zero, the job is marked failed in Redis and won't auto-retry.
-
-**Why:** Prevents resource exhaustion from looping failures. Operator must investigate root cause and manually trigger new build.
-
-**Check:** `curl /status` shows `lastStatus:'failed'` and `lastError` with exit code.
-
-### 3. Concurrent Triggers on Same Target
-
-**Caveat:** If a build for staging is running and another trigger arrives, it's queued as "followup".
-
-**Behavior:**
-- First trigger starts job immediately
-- Second trigger sets Redis flag `build:astro:followup:staging = '1'` and returns `status:'queued_followup'`
-- After first job completes, orchestrator checks flag and enqueues one more run
-- This coalesces multiple concurrent requests into 2 runs (current + 1 followup)
-
-**Why:** Prevents queue explosion if WordPress plugin fires multiple saves quickly. Followup carries `source:'followup'` instead of 'save' or 'manual'.
-
-### 4. Job State Cleanup
-
-**Caveat:** Jobs in `failed` or `completed` state are removed before re-enqueueing with same jobId.
-
-**Why:** BullMQ requires unique job IDs. If a job with ID `deploy-staging` exists in any final state (failed/completed), a new job can't be added with that ID.
-
-**Behavior:** On second trigger for staging, if previous job failed, old job is deleted and new one created.
-
-### 5. Max Backups Cleanup
+### Max Backups Cleanup
 
 **Caveat:** Archive files older than `MAX_BACKUPS` are deleted **on disk** after each successful build.
-
-**Why:** Zip files accumulate and can exhaust storage. Cleanup ensures only N most recent builds retained.
 
 **Timing:** Cleanup runs after script succeeds and archive is discovered, but before status is marked done.
 
 **Data Loss Risk:** If cleanup threshold is very low (e.g., 1), only the current build remains on disk. No historical backups for recovery.
 
-### 6. Save-Trigger Debounce
+### Script Env Vars
+Deploy scripts receive `MODE`, `BACKUP_TARGET`, `BACKUP_SOURCE_DIR`, `ASTRO_BUILD_BACKUP`. Mismatch with configured paths causes silent failures.
 
-**Caveat:** If `source:'save'` (debounced), job is delayed by `BUILD_DEBOUNCE_SECONDS` (default 120s).
-
-**Why:** Prevents rapid deployment from multiple consecutive WordPress saves. Groups saves into single build.
-
-**Behavior:**
-```
-Save 1 → Job enqueued with delay=120s
-Save 2 → Job exists in 'delayed' state → Remove old, add new (resetting delay)
-Save 3 (after 100s) → Same, delay reset again
-...
-After 120s of no new saves → Job executes
-```
-
-**Caveat:** If save triggers and manual trigger arrives, manual is immediate (delay=0) but deploy scripts serialize (concurrency=1), so they run sequentially anyway.
-
-### 7. Status File Schema
-
-**Caveat:** Status file has nested structure per environment (`envs.dev`, `envs.staging`, `envs.production`).
-
-**Why:** Allows independent tracking of three targets without mixing state.
-
-**Note:** `updateStatus()` handles normalization. Manual edits to status file may cause schema mismatches if not careful.
-
-**Backup Tracking:** `backups[]` array limited to 12 entries (or `MAX_BACKUPS`) in memory. Older entries dropped. Actual disk files cleaned separately by `cleanupOldArchives()`.
-
-### 8. Script Environment Variables
-
-**Caveat:** Deploy scripts receive env vars from orchestrator:
-- `MODE=development` (for dev) or `staging` or `production`
-- `BACKUP_TARGET=dev|staging|production`
-- `BACKUP_SOURCE_DIR=/shared/static/{env}`
-- `ASTRO_BUILD_BACKUP=1`
-
-**Why:** Scripts need to know which environment to deploy and where to back up from/to.
-
-**Important:** Scripts source these but also set their own (e.g., `DEV_BUILD_PATH`). Mismatch can cause builds to fail silently (wrong output path, backup skipped).
-
-### 9. Worker Concurrency = 1
-
-**Caveat:** Only one build runs at a time across all targets.
-
-**Why:** Shared infrastructure (npm cache, build cache, file I/O) can't handle parallel builds safely.
-
-**Implication:** If dev starts, staging trigger queues. Once dev finishes, staging runs. Max latency ≈ longest build duration (typically 20-60s per env).
-
-### 10. Redis Persistence
-
-**Caveat:** If Redis container restarts, queue is lost (assuming no snapshot taken).
-
-**Why:** Redis running in-memory by default in compose setup.
-
-**Workaround:** Configure Redis persistence (`RDB` snapshots or `AOF` logs) if durability critical. Orchestrator will continue accepting triggers but jobs already queued will be lost.
-
-### 11. Status File Doesn't Auto-Sync to WordPress
-
-**Caveat:** Orchestrator writes status file to disk. WordPress plugin must read it.
-
-**Why:** No built-in webhook/polling from orchestrator to WordPress.
-
-**Workaround:** WordPress plugin polls `/status` endpoint or reads status file directly (if mounted).
+### Redis Persistence
+If Redis restarts, queue is lost unless persistence configured (`RDB`/`AOF`).
 
 ## Monitoring
 
@@ -358,18 +278,10 @@ GET "build:astro:followup:staging"
 - Check Redis connection: `docker logs deploy-orchestrator | grep "redis"`
 - Verify concurrency=1 worker is active: `docker logs deploy-orchestrator | grep "worker:completed"`
 
-**Build fails with exit code 15:**
-- Check deploy script permissions and env vars
-- Verify `STAGING_BUILD_PATH` exists: `docker exec astro ls -la /shared/static/staging`
+**Build fails silently:**
+- Check script: `docker logs deploy-orchestrator | grep "exit"`
+- Verify build paths exist: `docker exec astro ls -la /shared/static/{dev,staging,prod}`
 
-**Archive cleanup isn't running:**
-- Check `MAX_BACKUPS` env var is set
-- Verify archives directory exists: `docker exec deploy-orchestrator ls -la /astro-site/build-archives/`
-
-**Status file not updating:**
-- Check orchestrator has write permissions to `build-archives/`
-- Verify job marked as done: `docker logs deploy-orchestrator | grep "deployment completed"`
-
-**Production save-trigger returns 403:**
-- This is expected/intentional. Use manual trigger instead.
-- Set `WP_SAVE_TRIGGER_QUEUE_ENABLED=1` in env if needed (dev/staging only).
+**Archive cleanup not running:**
+- Verify orchestrator write perms: `ls -la /astro-site/build-archives/`
+- Check `MAX_BACKUPS` env var (default 12)
