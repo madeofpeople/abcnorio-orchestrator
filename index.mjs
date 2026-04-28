@@ -33,6 +33,16 @@ const TARGETS = {
   production: process.env.PRODUCTION_BUILD_PATH || '',
 };
 
+if (!SECRET) {
+  console.error('[startup] FATAL: ASTRO_BUILD_TRIGGER_SECRET is not set — refusing to start');
+  process.exit(1);
+}
+
+if (!Object.values(TARGETS).some(Boolean)) {
+  console.error('[startup] FATAL: no deploy targets configured (set DEV_BUILD_PATH, STAGING_BUILD_PATH, or PRODUCTION_BUILD_PATH)');
+  process.exit(1);
+}
+
 /** @type {{ status: 'idle'|'running'|'done'|'failed', target: string|null, started: number|null, finished: number|null, exitCode: number|null, message: string|null }} */
 let state = {
   status: 'idle',
@@ -43,7 +53,18 @@ let state = {
   message: null,
 };
 
-const redis = new IORedis(REDIS_URL, { maxRetriesPerRequest: null });
+const redis = new IORedis(REDIS_URL, { maxRetriesPerRequest: null, lazyConnect: true });
+redis.on('error', () => {});
+
+try {
+  await redis.connect();
+} catch (err) {
+  console.error(`[startup] FATAL: Redis unreachable at ${REDIS_URL} — ${err.message}`);
+  process.exit(1);
+}
+
+redis.removeAllListeners('error');
+
 const queue = new Queue(QUEUE_NAME, { connection: redis });
 
 function normalizeScope(scope) {
