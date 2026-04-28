@@ -24,11 +24,13 @@ deploy-orchestrator/
 - Routes: `POST /trigger`, `GET /status`, `GET /health`
 - Auth via Bearer token (`ASTRO_BUILD_TRIGGER_SECRET`)
 - BullMQ Worker instance (concurrency=1, serialized execution)
-- Job enqueueing logic with native BullMQ deduplication [`keepLastIfActive`](https://github.com/taskforcesh/bullmq/compare/v5.71.1...v5.72.0)
+- Job enqueueing logic with BullMQ deduplication id `deploy-<target>`
 - Event handlers for job completion/failure
+- Preview→production candidate reuse is handled in worker JS flow (archive restore + fingerprint check), not in `deploy.sh`
 
 #### **status.mjs**
 - Canonical status file operations (`build-archives/deployment-status.json`)
+- Runtime status operations for `/status` response (`getRuntimeState`, `setRuntimeState`)
 - Per-environment tracking: `lastRequestedAt`, `lastStartedAt`, `lastFinishedAt`, `lastStatus`, `lastError`
 - Build metadata: `currentBuild.{path, clientPath, hasBuild, updatedAt}`
 - Backup tracking: `latestBackup`, `backups[]` (tracks created zips)
@@ -74,7 +76,7 @@ Behavior for same target dedup id:
 ```
 
 **Redis writes:**
-- `bull:astro-build:*` keys: Job data, state, metadata
+- `bull:astro-build:*` keys: job data, queue metadata
 - Status file also written to disk via status.mjs
 
 ### 3. Worker Processing (Redis → Orchestrator → Scripts)
@@ -101,6 +103,12 @@ If exit code 0:
 Else if exit code != 0:
   markFailed(target, error) → status file: lastStatus='failed', lastError
   Throw error (job marked failed in Redis)
+
+Preview target special path:
+       - Worker snapshots production archives before running preview build
+       - deploy.sh creates preview artifacts and a production backup archive
+       - Worker detects newly-created production archive, fingerprints preview build dir, and saves candidate metadata
+       - On later production trigger, worker compares fingerprint and restores candidate archive directly when unchanged
 ```
 
 **Redis operations during worker processing:**
@@ -112,9 +120,9 @@ Else if exit code != 0:
 ```
 GET /status
        ↓
-Orchestrator returns current state object
+Orchestrator returns `status.runtime` from deployment-status.json
        ↓
-OR WordPress plugin reads status file directly:
+WordPress plugin reads status file directly:
   cat /shared/astro/build-archives/deployment-status.json
        ↓
 Extract: envs.staging.currentBuild.hasBuild, lastFinishedAt, lastStatus
@@ -148,7 +156,7 @@ curl http://localhost:4011/status \
        -H "Authorization: Bearer $ASTRO_BUILD_TRIGGER_SECRET"
 
 # Response:
-# {"status":"running","target":"staging","started":1777207930000,...}
+# {"status":"running","target":"staging","started":1777207930000,"finished":null,"exitCode":null,"message":null,"updatedAt":"..."}
 ```
 
 ### Follow Build Progress
@@ -222,6 +230,16 @@ Current suite uses (`node --test`) and focuses on helper-level checks in `test/f
 
 **Data Loss Risk:** If cleanup threshold is very low (e.g., 1), only the current build remains on disk. No historical backups for recovery.
 
+### Preview Candidate Metadata Lifecycle
+
+Preview candidate metadata is stored at `build-archives/.production-preview-candidate.meta`.
+
+- Create: written by worker after a successful preview build when a new production archive is detected.
+- Use: read by worker on production trigger; if preview fingerprint matches, candidate archive is restored directly.
+- Clear: deleted by worker immediately after successful candidate-based production restore.
+- Miss/mismatch behavior: if metadata is missing, archive missing, or fingerprint differs, worker falls back to full production build path.
+- Hygiene: metadata is transient and should not be hand-edited.
+
 ### Script Env Vars
 Deploy scripts receive `MODE`, `BACKUP_TARGET`, `BACKUP_SOURCE_DIR`, `ASTRO_BUILD_BACKUP`. Mismatch with configured paths causes silent failures.
 
@@ -249,7 +267,7 @@ docker logs deploy-orchestrator | grep "worker:completed" | wc -l
 ### Status File
 
 ```bash
-# Check current state
+# Check current runtime status + env status
 cat /shared/astro/build-archives/deployment-status.json | python3 -m json.tool
 
 # Watch for updates

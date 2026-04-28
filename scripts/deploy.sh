@@ -17,28 +17,39 @@ case "$TARGET" in
   dev)
     MODE=development
     BUILD_PATH="${DEV_BUILD_PATH:-}"
+    BUILD_CACHE_TTL_MS=0
     ;;
   staging)
     MODE=staging
     BUILD_PATH="${STAGING_BUILD_PATH:-}"
+    BUILD_CACHE_TTL_MS=0
     ;;
   production)
     MODE=production
     BUILD_PATH="${PRODUCTION_BUILD_PATH:-}"
+    BUILD_CACHE_TTL_MS="${BUILD_CACHE_TTL_MS:-900000}"
+    ;;
+  preview)
+    MODE=staging
+    BUILD_PATH="${PREVIEW_BUILD_PATH:-}"
+    BUILD_CACHE_TTL_MS=0
     ;;
   *)
-    echo "Invalid target: $TARGET (expected: dev|staging|production)"
+    echo "Invalid target: $TARGET (expected: dev|staging|production|preview)"
     exit 1
     ;;
 esac
 
-echo "${HOME} Deploying Astro in ${MODE} mode (scope=${SCOPE})... at ${BUILD_PATH}"
+echo "Deploying Astro in ${MODE} mode (scope=${SCOPE})... at ${BUILD_PATH}"
 
 if [ -n "${BUILD_PATH}" ] && [ -d "${BUILD_PATH}" ]; then
-    npm install
+    if [[ ! -d node_modules ]]; then
+      npm install
+    fi
     rm -rf ./dist
     export MODE
     export SCOPE
+    export BUILD_CACHE_TTL_MS
     export BACKUP_TARGET="${TARGET}"
     export BACKUP_SOURCE_DIR="${BUILD_PATH}"
     export ASTRO_BUILD_BACKUP=1
@@ -46,15 +57,27 @@ if [ -n "${BUILD_PATH}" ] && [ -d "${BUILD_PATH}" ]; then
     npm run build:site
 
     if [[ "$SCOPE" != "full" ]]; then
-      if [[ -d "./dist/${SCOPE}" ]]; then
-        rm -rf "${BUILD_PATH}/${SCOPE}"
-        cp -R "./dist/${SCOPE}" "${BUILD_PATH}/${SCOPE}"
+      if [[ -d "./dist/client/${SCOPE}" ]]; then
+        rm -rf "${BUILD_PATH}/client/${SCOPE}"
+        cp -R "./dist/client/${SCOPE}" "${BUILD_PATH}/client/${SCOPE}"
+        if [[ -d "./dist/client/_astro" ]]; then
+          rm -rf "${BUILD_PATH}/client/_astro"
+          cp -R "./dist/client/_astro" "${BUILD_PATH}/client/_astro"
+        fi
       else
-        echo "Scoped output ./dist/${SCOPE} not found; skipping segmented copy."
+        echo "Scoped output ./dist/client/${SCOPE} not found; falling back to full deploy."
+        find "${BUILD_PATH}" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+        cp -R ./dist/. "${BUILD_PATH}/"
       fi
     else
       find "${BUILD_PATH}" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
       cp -R ./dist/. "${BUILD_PATH}/"
+    fi
+
+    if [[ "$TARGET" == "preview" ]]; then
+      export BACKUP_TARGET="production"
+      export BACKUP_SOURCE_DIR="${BUILD_PATH}"
+      bash "${ORCHESTRATOR_SCRIPT_ROOT:-/orchestrator/scripts}/backup-build.sh"
     fi
 else
     echo "Build path not set or missing for target=${TARGET}. Skipping Astro build."

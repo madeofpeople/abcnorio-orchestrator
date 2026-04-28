@@ -55,22 +55,6 @@ export function runCommand(command, args) {
   });
 }
 
-function emptyDirectory(dirPath) {
-  const entries = fs.readdirSync(dirPath, { withFileTypes: true });
-  for (const entry of entries) {
-    fs.rmSync(path.join(dirPath, entry.name), { recursive: true, force: true });
-  }
-}
-
-function copyDirectoryContents(sourceDir, targetDir) {
-  const entries = fs.readdirSync(sourceDir, { withFileTypes: true });
-  for (const entry of entries) {
-    const sourcePath = path.join(sourceDir, entry.name);
-    const targetPath = path.join(targetDir, entry.name);
-    fs.cpSync(sourcePath, targetPath, { recursive: true, force: true });
-  }
-}
-
 export async function restoreArchiveToTarget(target, archivePath, deployBuildPath) {
   const resolvedDeployPath = assertDeployPath(target, deployBuildPath);
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'abcnorio-restore-'));
@@ -81,13 +65,20 @@ export async function restoreArchiveToTarget(target, archivePath, deployBuildPat
       throw new Error('failed to extract archive');
     }
 
-    const extractedRoot = path.join(tmpDir, path.basename(resolvedDeployPath));
-    if (!fs.existsSync(extractedRoot) || !fs.statSync(extractedRoot).isDirectory()) {
+    // Candidate archives may come from a different target path (e.g. preview archive restored to production),
+    // so resolve extracted root from archive contents instead of assuming deploy-path basename.
+    const extractedEntries = fs.readdirSync(tmpDir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && entry.name !== '__MACOSX');
+    if (extractedEntries.length !== 1) {
       throw new Error('invalid archive structure');
     }
+    const extractedRoot = path.join(tmpDir, extractedEntries[0].name);
 
-    emptyDirectory(resolvedDeployPath);
-    copyDirectoryContents(extractedRoot, resolvedDeployPath);
+    const entries = fs.readdirSync(resolvedDeployPath, { withFileTypes: true });
+    for (const entry of entries) {
+      fs.rmSync(path.join(resolvedDeployPath, entry.name), { recursive: true, force: true });
+    }
+    fs.cpSync(extractedRoot, resolvedDeployPath, { recursive: true, force: true });
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }

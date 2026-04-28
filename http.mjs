@@ -9,6 +9,7 @@ export function getAuthToken(req) {
 
 export function readJsonBody(req) {
   return new Promise((resolve, reject) => {
+    req.setEncoding('utf8');
     let body = '';
     req.on('data', (chunk) => {
       body += chunk;
