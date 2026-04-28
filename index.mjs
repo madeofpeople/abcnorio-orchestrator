@@ -28,8 +28,12 @@ const WORKER_LOCK_MS = Number(process.env.ORCHESTRATOR_WORKER_LOCK_MS || 300000)
 const WORKER_STALLED_INTERVAL_MS = Number(process.env.ORCHESTRATOR_WORKER_STALLED_INTERVAL_MS || 30000);
 
 const WORKDIR = process.env.ASTRO_SITE_ROOT || '/astro-site';
+const STAGING_WORKDIR = process.env.ASTRO_STAGING_SITE_ROOT || '';
 const SCRIPT_ROOT = process.env.ORCHESTRATOR_SCRIPT_ROOT || '/orchestrator/scripts';
 const ARCHIVE_DIR = path.resolve(WORKDIR, 'build-archives');
+
+const PUSH_EXCLUDE = new Set(['node_modules', '.astro', 'dist', 'build-archives', '.git']);
+let pushState = { status: 'idle', started: null, finished: null, message: null };
 
 const DEPLOY_SCRIPT = path.join(SCRIPT_ROOT, 'deploy.sh');
 const TARGETS = {
@@ -130,6 +134,11 @@ const worker = new Worker(
         if (currentFingerprint === candidate.fingerprint) {
           console.log(`[worker] production: reusing preview candidate archive: ${path.basename(candidate.archivePath)}`);
           await restoreArchiveToTarget('production', candidate.archivePath, deployBuildPath);
+          const promotedName = path.basename(candidate.archivePath).replace('-preview-', '-production-');
+          const promotedPath = path.join(ARCHIVE_DIR, promotedName);
+          fs.renameSync(candidate.archivePath, promotedPath);
+          cleanupOldArchives('production', MAX_BACKUPS);
+          updateStatus('backup', 'production', { archivePath: promotedPath });
           clearPreviewCandidate();
           updateStatus('deploy', target, { deployBuildPath: resolvedDeployPath });
           setRuntimeState({ status: 'done', target, started: startedAt, finished: Date.now(), exitCode: 0, message: null });
@@ -143,7 +152,6 @@ const worker = new Worker(
 
     console.log(`[worker] ${target} executing ${DEPLOY_SCRIPT}`);
     const archiveBefore = new Set(listArchivesForTarget(target));
-    const productionArchiveBefore = target === 'preview' ? new Set(listArchivesForTarget('production')) : null;
     const exitCode = await runCommand('bash', [DEPLOY_SCRIPT, target, scope]);
     console.log(`[worker] ${target} script exited with code ${exitCode}`);
 
@@ -172,24 +180,17 @@ const worker = new Worker(
 
     const archivePath = path.join(ARCHIVE_DIR, createdArchive);
     console.log(`[worker] ${target} found archive: ${path.basename(archivePath)}`);
-    cleanupOldArchives(target, MAX_BACKUPS);
+    cleanupOldArchives(target, target === 'preview' ? 1 : MAX_BACKUPS);
     updateStatus('backup', target, { archivePath });
     updateStatus('deploy', target, { deployBuildPath: resolvedDeployPath });
 
-    // --- After a preview build: capture a production candidate archive ---
-    if (target === 'preview' && productionArchiveBefore) {
+    // --- After a preview build: store archive as production candidate ---
+    if (target === 'preview') {
       const previewPath = TARGETS['preview'];
-      // deploy.sh already ran backup-build.sh with BACKUP_TARGET=production; find the new archive
-      const newProductionArchive = listArchivesForTarget('production').find((n) => !productionArchiveBefore.has(n));
-      if (newProductionArchive && previewPath && fs.existsSync(previewPath)) {
-        const productionArchivePath = path.join(ARCHIVE_DIR, newProductionArchive);
+      if (previewPath && fs.existsSync(previewPath)) {
         const fingerprint = dirFingerprint(previewPath);
-        writePreviewCandidate(productionArchivePath, fingerprint);
-        cleanupOldArchives('production', MAX_BACKUPS);
-        updateStatus('backup', 'production', { archivePath: productionArchivePath });
-        console.log(`[worker] preview candidate saved: ${newProductionArchive}`);
-      } else {
-        console.warn('[worker] preview build did not produce a new production archive');
+        writePreviewCandidate(archivePath, fingerprint);
+        console.log(`[worker] preview candidate saved: ${createdArchive}`);
       }
     }
 
@@ -358,6 +359,43 @@ const server = http.createServer(async (req, res) => {
         message: error instanceof Error ? error.message : 'unknown error',
       });
     }
+  }
+
+  if (req.method === 'GET' && req.url === '/dev-tools/status') {
+    return respond(200, pushState);
+  }
+
+  if (req.method === 'POST' && req.url === '/dev-tools/push-to-staging') {
+    if (!STAGING_WORKDIR) {
+      return respond(500, { error: 'ASTRO_STAGING_SITE_ROOT is not configured' });
+    }
+
+    if (pushState.status === 'running') {
+      return respond(409, { error: 'push already in progress' });
+    }
+
+    const startedAt = Date.now();
+    pushState = { status: 'running', started: startedAt, finished: null, message: null };
+    console.log(`[push-to-staging] started: ${WORKDIR} \u2192 ${STAGING_WORKDIR}`);
+
+    const sentinelPath = path.join(STAGING_WORKDIR, '.push-in-progress');
+    try { fs.writeFileSync(sentinelPath, ''); } catch {}
+
+    fs.promises.cp(WORKDIR, STAGING_WORKDIR, {
+      recursive: true,
+      force: true,
+      filter: (src) => !PUSH_EXCLUDE.has(path.basename(src)),
+    }).then(() => {
+      try { fs.unlinkSync(sentinelPath); } catch {}
+      pushState = { status: 'done', started: startedAt, finished: Date.now(), message: 'Code pushed to staging.' };
+      console.log('[push-to-staging] complete');
+    }).catch((err) => {
+      try { fs.unlinkSync(sentinelPath); } catch {}
+      pushState = { status: 'failed', started: startedAt, finished: Date.now(), message: err.message };
+      console.error(`[push-to-staging] failed: ${err.message}`);
+    });
+
+    return respond(202, { status: 'running' });
   }
 
   respond(404, { error: 'not found' });

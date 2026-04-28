@@ -74,11 +74,6 @@ if [ -n "${BUILD_PATH}" ] && [ -d "${BUILD_PATH}" ]; then
       cp -R ./dist/. "${BUILD_PATH}/"
     fi
 
-    if [[ "$TARGET" == "preview" ]]; then
-      export BACKUP_TARGET="production"
-      export BACKUP_SOURCE_DIR="${BUILD_PATH}"
-      bash "${ORCHESTRATOR_SCRIPT_ROOT:-/orchestrator/scripts}/backup-build.sh"
-    fi
 else
     echo "Build path not set or missing for target=${TARGET}. Skipping Astro build."
 fi
