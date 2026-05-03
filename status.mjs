@@ -10,7 +10,7 @@ const STATUS_FILE = process.env.ASTRO_DEPLOYMENT_STATUS_FILE
 const PREVIEW_CANDIDATE_META = path.join(ARCHIVE_DIR, '.production-preview-candidate.meta');
 const ENV_KEYS = ['dev', 'staging', 'production', 'preview'];
 
-export function defaultRuntimeState() {
+function defaultRuntimeState() {
   return {
     status: 'idle',
     target: null,
@@ -22,7 +22,7 @@ export function defaultRuntimeState() {
   };
 }
 
-export function defaultEnvStatus() {
+function defaultEnvStatus() {
   return {
     lastRequestedAt: null,
     lastStartedAt: null,
@@ -40,7 +40,7 @@ export function defaultEnvStatus() {
   };
 }
 
-export function normalizeStatus(input) {
+function normalizeStatus(input) {
   const status = input && typeof input === 'object' ? input : {};
 
   const runtime = status.runtime && typeof status.runtime === 'object'
@@ -94,9 +94,15 @@ export function loadStatus() {
   }
 }
 
-export function ensureEnvStatus(status, env) {
+function ensureEnvStatus(status, env) {
   normalizeStatus(status);
   return status.envs[env];
+}
+
+function updateEnv(target, fn) {
+  const status = loadStatus();
+  fn(ensureEnvStatus(status, target));
+  saveStatus(status);
 }
 
 export function saveStatus(status) {
@@ -107,37 +113,31 @@ export function saveStatus(status) {
 }
 
 export function markRequested(target) {
-  const status = loadStatus();
-  const envStatus = ensureEnvStatus(status, target);
-  envStatus.lastRequestedAt = new Date().toISOString();
-  saveStatus(status);
+  updateEnv(target, (env) => { env.lastRequestedAt = new Date().toISOString(); });
 }
 
 export function markStarted(target) {
-  const status = loadStatus();
-  const envStatus = ensureEnvStatus(status, target);
-  envStatus.lastStartedAt = new Date().toISOString();
-  envStatus.lastStatus = 'running';
-  envStatus.lastError = null;
-  saveStatus(status);
+  updateEnv(target, (env) => {
+    env.lastStartedAt = new Date().toISOString();
+    env.lastStatus = 'running';
+    env.lastError = null;
+  });
 }
 
 export function markDone(target) {
-  const status = loadStatus();
-  const envStatus = ensureEnvStatus(status, target);
-  envStatus.lastFinishedAt = new Date().toISOString();
-  envStatus.lastStatus = 'done';
-  envStatus.lastError = null;
-  saveStatus(status);
+  updateEnv(target, (env) => {
+    env.lastFinishedAt = new Date().toISOString();
+    env.lastStatus = 'done';
+    env.lastError = null;
+  });
 }
 
 export function markFailed(target, message) {
-  const status = loadStatus();
-  const envStatus = ensureEnvStatus(status, target);
-  envStatus.lastFinishedAt = new Date().toISOString();
-  envStatus.lastStatus = 'failed';
-  envStatus.lastError = message || 'job failed';
-  saveStatus(status);
+  updateEnv(target, (env) => {
+    env.lastFinishedAt = new Date().toISOString();
+    env.lastStatus = 'failed';
+    env.lastError = message || 'job failed';
+  });
 }
 
 export function recordBackup(status, target, archivePath) {
@@ -162,13 +162,13 @@ export function recordBackup(status, target, archivePath) {
   envStatus.latestBackup = backup;
 }
 
-export function hasClientBuild(pathToBuildRoot) {
+function hasClientBuild(pathToBuildRoot) {
   const clientPath = path.join(pathToBuildRoot, 'client');
   return fs.existsSync(clientPath)
     && fs.readdirSync(clientPath).some((entry) => entry !== '.' && entry !== '..');
 }
 
-export function recordDeploy(status, target, deployBuildPath) {
+function recordDeploy(status, target, deployBuildPath) {
   const resolvedBuildPath = path.resolve(deployBuildPath);
   const clientPath = path.join(resolvedBuildPath, 'client');
   const hasBuild = hasClientBuild(resolvedBuildPath);
@@ -219,13 +219,12 @@ export function getRuntimeState() {
 }
 
 export function removeBackupFromStatus(target, name) {
-  const status = loadStatus();
-  const envStatus = ensureEnvStatus(status, target);
-  envStatus.backups = envStatus.backups.filter((b) => b?.name !== name);
-  if (envStatus.latestBackup?.name === name) {
-    envStatus.latestBackup = envStatus.backups[0] ?? null;
-  }
-  saveStatus(status);
+  updateEnv(target, (env) => {
+    env.backups = env.backups.filter((b) => b?.name !== name);
+    if (env.latestBackup?.name === name) {
+      env.latestBackup = env.backups[0] ?? null;
+    }
+  });
 }
 
 /**

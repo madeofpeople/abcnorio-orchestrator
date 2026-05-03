@@ -27,10 +27,10 @@ case "$TARGET" in
   production)
     MODE=production
     BUILD_PATH="${PRODUCTION_BUILD_PATH:-}"
-    BUILD_CACHE_TTL_MS="${BUILD_CACHE_TTL_MS:-900000}"
+    BUILD_CACHE_TTL_MS=0
     ;;
   preview)
-    MODE=staging
+    MODE=preview
     BUILD_PATH="${PREVIEW_BUILD_PATH:-}"
     BUILD_CACHE_TTL_MS=0
     ;;

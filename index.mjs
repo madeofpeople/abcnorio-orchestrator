@@ -1,8 +1,8 @@
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
-import { Queue, Worker } from 'bullmq';
-import IORedis from 'ioredis';
+import { enqueue, getQueueStatus } from './queue.mjs';
+import { devToolsState, startDevOp, copyMediaFiles, dumpDatabase, uploads, db } from './dev-tools.mjs';
 import { getAuthToken, readJsonBody } from './http.mjs';
 import {
   listArchivesForTarget,
@@ -20,12 +20,8 @@ import {
 
 const PORT = Number(process.env.ORCHESTRATOR_PORT || 4011);
 const SECRET = process.env.ASTRO_BUILD_TRIGGER_SECRET || '';
-const REDIS_URL = process.env.REDIS_URL || 'redis://redis:6379';
-const QUEUE_NAME = process.env.BUILD_QUEUE_NAME || 'astro-build';
 const ALLOW_MANUAL_TRIGGER = process.env.ORCHESTRATOR_ALLOW_MANUAL_TRIGGER !== '0';
 const MAX_BACKUPS = Number(process.env.MAX_BACKUPS || 12);
-const WORKER_LOCK_MS = Number(process.env.ORCHESTRATOR_WORKER_LOCK_MS || 300000);
-const WORKER_STALLED_INTERVAL_MS = Number(process.env.ORCHESTRATOR_WORKER_STALLED_INTERVAL_MS || 30000);
 
 const WORKDIR = process.env.ASTRO_SITE_ROOT || '/astro-site';
 const STAGING_WORKDIR = process.env.ASTRO_STAGING_SITE_ROOT || '';
@@ -33,12 +29,61 @@ const SCRIPT_ROOT = process.env.ORCHESTRATOR_SCRIPT_ROOT || '/orchestrator/scrip
 const ARCHIVE_DIR = path.resolve(WORKDIR, 'build-archives');
 
 const PUSH_EXCLUDE = new Set(['node_modules', '.astro', 'dist', 'build-archives', '.git']);
-let pushState = { status: 'idle', started: null, finished: null, message: null };
+
+const DEV_OPS = {
+  '/dev-tools/copy-media-to-staging': {
+    key: 'copyMediaToStagingFromDev',
+    label: 'copy-media-to-staging',
+    run: () => copyMediaFiles(uploads.dev, uploads.staging).then(() => 'Media copied to staging.'),
+  },
+  '/dev-tools/copy-media-to-dev': {
+    key: 'copyMediaFromStagingToDev',
+    label: 'copy-media-to-dev',
+    run: () => copyMediaFiles(uploads.staging, uploads.dev).then(() => 'Media copied to dev.'),
+  },
+  '/dev-tools/pull-from-dev': {
+    key: 'pullDBFromDevToStaging',
+    label: 'pull-from-dev',
+    requiresDb: true,
+    run: async () => {
+      await copyMediaFiles(uploads.dev, uploads.staging);
+      await dumpDatabase(db.dev, db.staging);
+      return 'Dev data pulled to staging.';
+    },
+  },
+  '/dev-tools/pull-from-staging': {
+    key: 'pullFromStagingToDev',
+    label: 'pull-from-staging',
+    requiresDb: true,
+    run: async () => {
+      await copyMediaFiles(uploads.staging, uploads.dev);
+      await dumpDatabase(db.staging, db.dev);
+      return 'Staging data pulled to dev.';
+    },
+  },
+  '/dev-tools/push-to-staging': {
+    key: 'push',
+    label: 'push-to-staging',
+    requiresStaging: true,
+    run: async () => {
+      const sentinelPath = path.join(STAGING_WORKDIR, '.push-in-progress');
+      try { fs.writeFileSync(sentinelPath, ''); } catch {}
+      try {
+        await fs.promises.cp(WORKDIR, STAGING_WORKDIR, {
+          recursive: true,
+          force: true,
+          filter: (src) => !PUSH_EXCLUDE.has(path.basename(src)),
+        });
+      } finally {
+        try { fs.unlinkSync(sentinelPath); } catch {}
+      }
+      return 'Code pushed to staging.';
+    },
+  },
+};
 
 const DEPLOY_SCRIPT = path.join(SCRIPT_ROOT, 'deploy.sh');
 const TARGETS = {
-  dev: process.env.DEV_BUILD_PATH || '',
-  staging: process.env.STAGING_BUILD_PATH || '',
   production: process.env.PRODUCTION_BUILD_PATH || '',
   preview: process.env.PREVIEW_BUILD_PATH || '',
 };
@@ -49,23 +94,9 @@ if (!SECRET) {
 }
 
 if (!Object.values(TARGETS).some(Boolean)) {
-  console.error('[startup] FATAL: no deploy targets configured (set DEV_BUILD_PATH, STAGING_BUILD_PATH, or PRODUCTION_BUILD_PATH)');
+  console.error('[startup] FATAL: no deploy targets configured (set PRODUCTION_BUILD_PATH or PREVIEW_BUILD_PATH)');
   process.exit(1);
 }
-
-const redis = new IORedis(REDIS_URL, { maxRetriesPerRequest: null, lazyConnect: true });
-redis.on('error', () => {});
-
-try {
-  await redis.connect();
-} catch (err) {
-  console.error(`[startup] FATAL: Redis unreachable at ${REDIS_URL} — ${err.message}`);
-  process.exit(1);
-}
-
-redis.removeAllListeners('error');
-
-const queue = new Queue(QUEUE_NAME, { connection: redis });
 
 function normalizeScope(scope) {
   const candidate = String(scope || 'full').trim().toLowerCase();
@@ -80,169 +111,113 @@ function normalizeScope(scope) {
   return 'full';
 }
 
-async function enqueueTarget(target, source = 'manual', scope = 'full') {
-  const normalizedScope = normalizeScope(scope);
-  const dedupId = `deploy-${target}`;
+async function buildJob(target, scope) {
+  console.log(`[worker] starting job for target=${target} scope=${scope}`);
 
-  await queue.add('deploy', { target, source, scope: normalizedScope }, {
-    deduplication: {
-      id: dedupId,
-    },
-    // Keep recent jobs to avoid finish-time key races under bursty triggers.
-    removeOnComplete: 100,
-    removeOnFail: 100,
+  const deployBuildPath = TARGETS[target];
+  const resolvedDeployPath = assertDeployPath(target, deployBuildPath);
+
+  const startedAt = Date.now();
+  setRuntimeState({
+    status: 'running',
+    target,
+    started: startedAt,
+    finished: null,
+    exitCode: null,
+    message: null,
   });
+  markStarted(target);
 
-  console.log(`[enqueue] trigger accepted for ${target} (source=${source}, scope=${normalizedScope}, dedup=${dedupId})`);
-  markRequested(target);
+  // --- Preview candidate reuse: if production is triggered and preview is unchanged, restore from archive ---
+  if (target === 'production') {
+    const candidate = readPreviewCandidate();
+    const previewPath = TARGETS['preview'];
+    if (candidate && previewPath && fs.existsSync(previewPath) && fs.existsSync(candidate.archivePath)) {
+      const currentFingerprint = dirFingerprint(previewPath);
+      if (currentFingerprint === candidate.fingerprint) {
+        console.log(`[worker] production: reusing preview candidate archive: ${path.basename(candidate.archivePath)}`);
+        await restoreArchiveToTarget('production', candidate.archivePath, deployBuildPath);
+        const promotedName = path.basename(candidate.archivePath).replace('-preview-', '-production-');
+        const promotedPath = path.join(ARCHIVE_DIR, promotedName);
+        fs.renameSync(candidate.archivePath, promotedPath);
+        cleanupOldArchives('production', MAX_BACKUPS);
+        updateStatus('backup', 'production', { archivePath: promotedPath });
+        clearPreviewCandidate();
+        updateStatus('deploy', target, { deployBuildPath: resolvedDeployPath });
+        setRuntimeState({ status: 'done', target, started: startedAt, finished: Date.now(), exitCode: 0, message: null });
+        markDone(target);
+        console.log(`[worker] production deployment completed (from preview candidate)`);
+        return;
+      }
+      console.log(`[worker] production: preview candidate fingerprint mismatch — doing full build`);
+    }
+  }
 
-  return { accepted: true };
+  console.log(`[worker] ${target} executing ${DEPLOY_SCRIPT}`);
+  const archiveBefore = new Set(listArchivesForTarget(target));
+  const exitCode = await runCommand('bash', [DEPLOY_SCRIPT, target, scope]);
+  console.log(`[worker] ${target} script exited with code ${exitCode}`);
+
+  if (exitCode !== 0) {
+    const message = `script failed with exit ${exitCode}`;
+    setRuntimeState({
+      status: 'failed',
+      target,
+      started: startedAt,
+      finished: Date.now(),
+      exitCode,
+      message,
+    });
+    markFailed(target, message);
+    console.log(`[worker] ${target} script failed: ${message}`);
+    throw new Error(message);
+  }
+
+  const archiveAfter = listArchivesForTarget(target);
+  const createdArchive = archiveAfter.find((name) => !archiveBefore.has(name));
+  if (!createdArchive) {
+    const message = `backup contract violation: no new archive created for target=${target}`;
+    console.warn(`[worker] ${message}`);
+    throw new Error(message);
+  }
+
+  const archivePath = path.join(ARCHIVE_DIR, createdArchive);
+  console.log(`[worker] ${target} found archive: ${path.basename(archivePath)}`);
+  cleanupOldArchives(target, target === 'preview' ? 1 : MAX_BACKUPS);
+  updateStatus('backup', target, { archivePath });
+  updateStatus('deploy', target, { deployBuildPath: resolvedDeployPath });
+
+  // --- After a preview build: store archive as production candidate ---
+  if (target === 'preview') {
+    const previewPath = TARGETS['preview'];
+    if (previewPath && fs.existsSync(previewPath)) {
+      const fingerprint = dirFingerprint(previewPath);
+      writePreviewCandidate(archivePath, fingerprint);
+      console.log(`[worker] preview candidate saved: ${createdArchive}`);
+    }
+  }
+
+  setRuntimeState({
+    status: 'done',
+    target,
+    started: startedAt,
+    finished: Date.now(),
+    exitCode: 0,
+    message: null,
+  });
+  markDone(target);
+  console.log(`[worker] ${target} deployment completed successfully`);
 }
 
-const worker = new Worker(
-  QUEUE_NAME,
-  async (job) => {
-    const { target } = job.data;
-    const scope = normalizeScope(job.data.scope);
-
-    console.log(`[worker] received job ${job.id} for target=${target} scope=${scope}`);
-
-    if (!TARGETS[target]) {
-      throw new Error(`invalid target: ${target}`);
-    }
-
-    const deployBuildPath = TARGETS[target];
-    const resolvedDeployPath = assertDeployPath(target, deployBuildPath);
-
-    const startedAt = Date.now();
-    setRuntimeState({
-      status: 'running',
-      target,
-      started: startedAt,
-      finished: null,
-      exitCode: null,
-      message: null,
-    });
-    markStarted(target);
-
-    // --- Preview candidate reuse: if production is triggered and preview is unchanged, restore from archive ---
-    if (target === 'production') {
-      const candidate = readPreviewCandidate();
-      const previewPath = TARGETS['preview'];
-      if (candidate && previewPath && fs.existsSync(previewPath) && fs.existsSync(candidate.archivePath)) {
-        const currentFingerprint = dirFingerprint(previewPath);
-        if (currentFingerprint === candidate.fingerprint) {
-          console.log(`[worker] production: reusing preview candidate archive: ${path.basename(candidate.archivePath)}`);
-          await restoreArchiveToTarget('production', candidate.archivePath, deployBuildPath);
-          const promotedName = path.basename(candidate.archivePath).replace('-preview-', '-production-');
-          const promotedPath = path.join(ARCHIVE_DIR, promotedName);
-          fs.renameSync(candidate.archivePath, promotedPath);
-          cleanupOldArchives('production', MAX_BACKUPS);
-          updateStatus('backup', 'production', { archivePath: promotedPath });
-          clearPreviewCandidate();
-          updateStatus('deploy', target, { deployBuildPath: resolvedDeployPath });
-          setRuntimeState({ status: 'done', target, started: startedAt, finished: Date.now(), exitCode: 0, message: null });
-          markDone(target);
-          console.log(`[worker] production deployment completed (from preview candidate)`);
-          return;
-        }
-        console.log(`[worker] production: preview candidate fingerprint mismatch — doing full build`);
-      }
-    }
-
-    console.log(`[worker] ${target} executing ${DEPLOY_SCRIPT}`);
-    const archiveBefore = new Set(listArchivesForTarget(target));
-    const exitCode = await runCommand('bash', [DEPLOY_SCRIPT, target, scope]);
-    console.log(`[worker] ${target} script exited with code ${exitCode}`);
-
-    if (exitCode !== 0) {
-      const message = `script failed with exit ${exitCode}`;
-      setRuntimeState({
-        status: 'failed',
-        target,
-        started: startedAt,
-        finished: Date.now(),
-        exitCode,
-        message,
-      });
-      markFailed(target, message);
-      console.log(`[worker] ${target} script failed: ${message}`);
-      throw new Error(message);
-    }
-
-    const archiveAfter = listArchivesForTarget(target);
-    const createdArchive = archiveAfter.find((name) => !archiveBefore.has(name));
-    if (!createdArchive) {
-      const message = `backup contract violation: no new archive created for target=${target}`;
-      console.warn(`[worker] ${message}`);
-      throw new Error(message);
-    }
-
-    const archivePath = path.join(ARCHIVE_DIR, createdArchive);
-    console.log(`[worker] ${target} found archive: ${path.basename(archivePath)}`);
-    cleanupOldArchives(target, target === 'preview' ? 1 : MAX_BACKUPS);
-    updateStatus('backup', target, { archivePath });
-    updateStatus('deploy', target, { deployBuildPath: resolvedDeployPath });
-
-    // --- After a preview build: store archive as production candidate ---
-    if (target === 'preview') {
-      const previewPath = TARGETS['preview'];
-      if (previewPath && fs.existsSync(previewPath)) {
-        const fingerprint = dirFingerprint(previewPath);
-        writePreviewCandidate(archivePath, fingerprint);
-        console.log(`[worker] preview candidate saved: ${createdArchive}`);
-      }
-    }
-
-    setRuntimeState({
-      status: 'done',
-      target,
-      started: startedAt,
-      finished: Date.now(),
-      exitCode: 0,
-      message: null,
-    });
-    markDone(target);
-    console.log(`[worker] ${target} deployment completed successfully`);
-  },
-  {
-    connection: redis,
-    concurrency: 1,
-    lockDuration: WORKER_LOCK_MS,
-    stalledInterval: WORKER_STALLED_INTERVAL_MS,
+function enqueueTarget(target, source = 'manual', scope = 'full') {
+  const normalizedScope = normalizeScope(scope);
+  const result = enqueue(target, source, normalizedScope, (t, _s, sc) => buildJob(t, sc));
+  if (result.accepted) {
+    console.log(`[enqueue] trigger accepted for ${target} (source=${source}, scope=${normalizedScope})`);
+    markRequested(target);
   }
-);
-
-worker.on('failed', async (job, error) => {
-  const runtime = getRuntimeState();
-  const target = job?.data?.target || runtime.target;
-  console.log(`[worker:failed] job ${job?.id} target=${target}: ${error?.message}`);
-
-  // Runtime status is already set in the worker body for script failures.
-  // Only update here for unexpected BullMQ-level failures (stalled, lock lost, etc.).
-  if (runtime.status !== 'failed') {
-    setRuntimeState({
-      ...runtime,
-      status: 'failed',
-      finished: Date.now(),
-      exitCode: runtime.exitCode ?? 1,
-      message: error?.message || 'job failed',
-    });
-    if (target) {
-      markFailed(target, error?.message || 'job failed');
-    }
-  }
-});
-
-worker.on('completed', (job) => {
-  console.log(`[worker:completed] job ${job.id} target=${job.data.target}`);
-});
-
-worker.on('error', (error) => {
-  console.log(`[worker:error] ${error.message}`);
-});
-
-console.log('[worker] initialized and ready');
+  return result;
+}
 
 const server = http.createServer(async (req, res) => {
   const respond = (code, data) => {
@@ -250,16 +225,16 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify(data));
   };
 
+  if (req.method === 'GET' && req.url === '/health') {
+    return respond(200, { status: 'ok' });
+  }
+
   if (!SECRET || getAuthToken(req) !== SECRET) {
     return respond(401, { error: 'unauthorized' });
   }
 
   if (req.method === 'GET' && req.url === '/status') {
     return respond(200, getRuntimeState());
-  }
-
-  if (req.method === 'GET' && req.url === '/health') {
-    return respond(200, { status: 'ok' });
   }
 
   if (req.method === 'POST' && req.url === '/trigger') {
@@ -286,17 +261,11 @@ const server = http.createServer(async (req, res) => {
       return respond(403, { error: 'production save-trigger is disabled' });
     }
 
-    try {
-      await enqueueTarget(target, source, scope);
-      return respond(202, {
-        status: 'queued',
-        target,
-        source,
-        scope,
-      });
-    } catch (error) {
-      return respond(500, { error: 'trigger failed', message: error instanceof Error ? error.message : 'unknown error' });
+    const result = enqueueTarget(target, source, scope);
+    if (!result.accepted) {
+      return respond(409, { error: 'build already queued' });
     }
+    return respond(202, { status: 'queued', target, source, scope });
   }
 
   if (req.method === 'POST' && req.url === '/restore') {
@@ -362,40 +331,19 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.method === 'GET' && req.url === '/dev-tools/status') {
-    return respond(200, pushState);
+    return respond(200, devToolsState);
   }
 
-  if (req.method === 'POST' && req.url === '/dev-tools/push-to-staging') {
-    if (!STAGING_WORKDIR) {
+  if (req.method === 'POST' && DEV_OPS[req.url]) {
+    const op = DEV_OPS[req.url];
+    if (op.requiresStaging && !STAGING_WORKDIR) {
       return respond(500, { error: 'ASTRO_STAGING_SITE_ROOT is not configured' });
     }
-
-    if (pushState.status === 'running') {
-      return respond(409, { error: 'push already in progress' });
+    if (op.requiresDb && (!db.dev.name || !db.staging.name)) {
+      return respond(500, { error: 'DB env vars not configured (DEV_DB_NAME / STAGING_DB_NAME)' });
     }
-
-    const startedAt = Date.now();
-    pushState = { status: 'running', started: startedAt, finished: null, message: null };
-    console.log(`[push-to-staging] started: ${WORKDIR} \u2192 ${STAGING_WORKDIR}`);
-
-    const sentinelPath = path.join(STAGING_WORKDIR, '.push-in-progress');
-    try { fs.writeFileSync(sentinelPath, ''); } catch {}
-
-    fs.promises.cp(WORKDIR, STAGING_WORKDIR, {
-      recursive: true,
-      force: true,
-      filter: (src) => !PUSH_EXCLUDE.has(path.basename(src)),
-    }).then(() => {
-      try { fs.unlinkSync(sentinelPath); } catch {}
-      pushState = { status: 'done', started: startedAt, finished: Date.now(), message: 'Code pushed to staging.' };
-      console.log('[push-to-staging] complete');
-    }).catch((err) => {
-      try { fs.unlinkSync(sentinelPath); } catch {}
-      pushState = { status: 'failed', started: startedAt, finished: Date.now(), message: err.message };
-      console.error(`[push-to-staging] failed: ${err.message}`);
-    });
-
-    return respond(202, { status: 'running' });
+    const started = startDevOp(op.key, op.label, op.run);
+    return respond(started ? 202 : 409, started ? { status: 'running' } : { error: 'already in progress' });
   }
 
   respond(404, { error: 'not found' });
@@ -404,5 +352,4 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, '0.0.0.0', () => {
   saveStatus(loadStatus());
   console.log(`[deploy-orchestrator] listening on :${PORT}`);
-  console.log(`[deploy-orchestrator] queue=${QUEUE_NAME} redis=${REDIS_URL}`);
 });
