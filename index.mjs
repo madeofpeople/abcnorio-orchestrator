@@ -28,7 +28,7 @@ const STAGING_WORKDIR = process.env.ASTRO_STAGING_SITE_ROOT || '';
 const SCRIPT_ROOT = process.env.ORCHESTRATOR_SCRIPT_ROOT || '/orchestrator/scripts';
 const ARCHIVE_DIR = path.resolve(WORKDIR, 'build-archives');
 
-const PUSH_EXCLUDE = new Set(['node_modules', '.astro', 'dist', 'build-archives', '.git']);
+const PUSH_EXCLUDE = new Set(['node_modules', '.astro', 'dist', 'build-archives', '.git', '.env']);
 
 const DEV_OPS = {
   '/dev-tools/copy-media-to-staging': {
@@ -67,7 +67,7 @@ const DEV_OPS = {
     requiresStaging: true,
     run: async () => {
       const sentinelPath = path.join(STAGING_WORKDIR, '.push-in-progress');
-      try { fs.writeFileSync(sentinelPath, ''); } catch {}
+      try { fs.writeFileSync(sentinelPath, ''); } catch { }
       try {
         await fs.promises.cp(WORKDIR, STAGING_WORKDIR, {
           recursive: true,
@@ -75,7 +75,7 @@ const DEV_OPS = {
           filter: (src) => !PUSH_EXCLUDE.has(path.basename(src)),
         });
       } finally {
-        try { fs.unlinkSync(sentinelPath); } catch {}
+        try { fs.unlinkSync(sentinelPath); } catch { }
       }
       return 'Code pushed to staging.';
     },
@@ -354,6 +354,7 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`[deploy-orchestrator] listening on :${PORT}`);
 });
 
+/* handle container shutdown, stop accepting requests, wait for jobs to finish, reset status. */
 async function shutdown(signal) {
   console.log(`[deploy-orchestrator] ${signal} received, shutting down...`);
   server.close(() => console.log('[deploy-orchestrator] HTTP server closed.'));
@@ -374,4 +375,4 @@ async function shutdown(signal) {
 }
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT',  () => shutdown('SIGINT'));
+process.on('SIGINT', () => shutdown('SIGINT'));
