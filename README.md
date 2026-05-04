@@ -168,10 +168,11 @@ Tests use `node --test`. Coverage: archive listing, validation, path traversal r
 ## Notes
 
 ### Max Backups Cleanup
-Cleanup runs after each successful build once the archive is discovered, before `markDone`. Low `MAX_BACKUPS` values leave little recovery history.
+Cleanup runs after each successful build once the archive is discovered, before `markDone`. 
+`MAX_BACKUPS` determined how many backups are saved.
 
 ### Preview Candidate Lifecycle
-After a successful preview build, fingerprint + archive path saved to `build-archives/.production-preview-candidate.meta`. On next production trigger, if fingerprint matches, the preview is copied over, rather than running a new build.
+After a successful preview build, fingerprint + archive path saved to `build-archives/.production-preview-candidate.meta`. On next production trigger, if fingerprint matches, we pass the pre built preview, rather than running a new build.
 
 ### Queue Persistence
 Jobs not yet running are lost on restart. Retriggering is cheap — WP plugin will re-enqueue on next save.
