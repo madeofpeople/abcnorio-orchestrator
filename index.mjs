@@ -353,3 +353,25 @@ server.listen(PORT, '0.0.0.0', () => {
   saveStatus(loadStatus());
   console.log(`[deploy-orchestrator] listening on :${PORT}`);
 });
+
+async function shutdown(signal) {
+  console.log(`[deploy-orchestrator] ${signal} received, shutting down...`);
+  server.close(() => console.log('[deploy-orchestrator] HTTP server closed.'));
+  const { status } = getQueueStatus();
+  if (status !== 'idle') {
+    console.log('[deploy-orchestrator] build in progress, waiting for queue to drain...');
+    await new Promise(resolve => {
+      const check = setInterval(() => {
+        if (getQueueStatus().status === 'idle') {
+          clearInterval(check);
+          resolve();
+        }
+      }, 500);
+    });
+    console.log('[deploy-orchestrator] queue drained.');
+  }
+  process.exit(0);
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT',  () => shutdown('SIGINT'));
