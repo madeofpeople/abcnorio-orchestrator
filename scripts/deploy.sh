@@ -74,6 +74,12 @@ if [ -n "${BUILD_PATH}" ] && [ -d "${BUILD_PATH}" ]; then
       cp -R ./dist/. "${BUILD_PATH}/"
     fi
 
+    if [[ "$TARGET" == "production" ]]; then
+      echo "$(date -u +%Y%m%dT%H%M%SZ)" > "${BUILD_PATH}/.deploy-version"
+      echo "Warming production caches..."
+      bash "${ORCHESTRATOR_SCRIPT_ROOT:-/orchestrator/scripts}/warm-cache.sh" || echo "Cache warm failed (non-fatal)"
+    fi
+
 else
     echo "Build path not set or missing for target=${TARGET}. Skipping Astro build."
 fi
