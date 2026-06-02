@@ -18,21 +18,25 @@ case "$TARGET" in
     MODE=development
     BUILD_PATH="${DEV_BUILD_PATH:-}"
     BUILD_CACHE_TTL_MS=0
+    SSR_RUNTIME_PATH=""
     ;;
   staging)
     MODE=staging
     BUILD_PATH="${STAGING_BUILD_PATH:-}"
     BUILD_CACHE_TTL_MS=0
+    SSR_RUNTIME_PATH=""
     ;;
   production)
     MODE=production
     BUILD_PATH="${PRODUCTION_BUILD_PATH:-}"
     BUILD_CACHE_TTL_MS=0
+    SSR_RUNTIME_PATH="${BUILD_PATH}/.ssr"
     ;;
   preview)
     MODE=preview
     BUILD_PATH="${PREVIEW_BUILD_PATH:-}"
     BUILD_CACHE_TTL_MS=0
+    SSR_RUNTIME_PATH=""
     ;;
   *)
     echo "Invalid target: $TARGET (expected: dev|staging|production|preview)"
@@ -41,6 +45,57 @@ case "$TARGET" in
 esac
 
 echo "Deploying Astro in ${MODE} mode (scope=${SCOPE})... at ${BUILD_PATH}"
+
+stage_production_ssr_runtime() {
+    local runtime_path="$1"
+    local temp_runtime_path="${runtime_path}.staging"
+
+    echo "Refreshing production SSR runtime at ${runtime_path}..."
+    rm -rf "${temp_runtime_path}"
+    mkdir -p "${temp_runtime_path}"
+    cp ./package.json "${temp_runtime_path}/package.json"
+    cp ./package-lock.json "${temp_runtime_path}/package-lock.json"
+    (
+      cd "${temp_runtime_path}"
+      npm ci --omit=dev
+    )
+    cp -R ./dist/server "${temp_runtime_path}/server"
+    cp -R ./dist/client "${temp_runtime_path}/client"
+    echo "$(date -u +%Y%m%dT%H%M%SZ)" > "${temp_runtime_path}/.deploy-version"
+
+    mkdir -p "${runtime_path}"
+    find "${runtime_path}" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+
+    for staged_entry in "${temp_runtime_path}"/* "${temp_runtime_path}"/.[!.]* "${temp_runtime_path}"/..?*; do
+      if [ ! -e "$staged_entry" ]; then
+        continue
+      fi
+      if [ "$(basename "$staged_entry")" = '.deploy-version' ]; then
+        continue
+      fi
+      cp -R "$staged_entry" "${runtime_path}/"
+    done
+
+    cp "${temp_runtime_path}/.deploy-version" "${runtime_path}/.deploy-version"
+    rm -rf "${temp_runtime_path}"
+}
+
+  build_production_candidate_archive() {
+    local candidate_dir
+
+    candidate_dir="$(mktemp -d)"
+    echo "Building production promotion candidate..."
+
+    rm -rf ./dist
+    MODE=production SCOPE=full BUILD_CACHE_TTL_MS=0 npm run build:site
+
+    mkdir -p "${candidate_dir}/client"
+    cp -R ./dist/client/. "${candidate_dir}/client/"
+    stage_production_ssr_runtime "${candidate_dir}/.ssr"
+
+    BACKUP_SOURCE_DIR="${candidate_dir}" BACKUP_TARGET="production-candidate" bash "${ORCHESTRATOR_SCRIPT_ROOT:-/orchestrator/scripts}/backup-build.sh"
+    rm -rf "${candidate_dir}"
+  }
 
 if [ -n "${BUILD_PATH}" ] && [ -d "${BUILD_PATH}" ]; then
     if [[ ! -d node_modules ]]; then
@@ -56,28 +111,64 @@ if [ -n "${BUILD_PATH}" ] && [ -d "${BUILD_PATH}" ]; then
     bash "${ORCHESTRATOR_SCRIPT_ROOT:-/orchestrator/scripts}/backup-build.sh"
     npm run build:site
 
-    if [[ "$SCOPE" != "full" ]]; then
-      if [[ -d "./dist/client/${SCOPE}" ]]; then
-        rm -rf "${BUILD_PATH}/client/${SCOPE}"
-        cp -R "./dist/client/${SCOPE}" "${BUILD_PATH}/client/${SCOPE}"
-        if [[ -d "./dist/client/_astro" ]]; then
-          rm -rf "${BUILD_PATH}/client/_astro"
-          cp -R "./dist/client/_astro" "${BUILD_PATH}/client/_astro"
+    if [[ "$TARGET" == "production" ]]; then
+      mkdir -p "${BUILD_PATH}/client"
+      if [[ "$SCOPE" != "full" ]]; then
+        if [[ -d "./dist/client/${SCOPE}" ]]; then
+          rm -rf "${BUILD_PATH}/client/${SCOPE}"
+          cp -R "./dist/client/${SCOPE}" "${BUILD_PATH}/client/${SCOPE}"
+          if [[ -d "./dist/client/_astro" ]]; then
+            rm -rf "${BUILD_PATH}/client/_astro"
+            cp -R "./dist/client/_astro" "${BUILD_PATH}/client/_astro"
+          fi
+        else
+          echo "Scoped output ./dist/client/${SCOPE} not found; falling back to full deploy."
+          find "${BUILD_PATH}" -mindepth 1 -maxdepth 1 ! -name '.ssr' -exec rm -rf {} +
+          mkdir -p "${BUILD_PATH}/client"
+          cp -R ./dist/client/. "${BUILD_PATH}/client/"
         fi
       else
-        echo "Scoped output ./dist/client/${SCOPE} not found; falling back to full deploy."
+        find "${BUILD_PATH}" -mindepth 1 -maxdepth 1 ! -name '.ssr' -exec rm -rf {} +
+        mkdir -p "${BUILD_PATH}/client"
+        cp -R ./dist/client/. "${BUILD_PATH}/client/"
+      fi
+
+      stage_production_ssr_runtime "${SSR_RUNTIME_PATH}"
+    else
+      if [[ "$SCOPE" != "full" ]]; then
+        if [[ -d "./dist/client/${SCOPE}" ]]; then
+          rm -rf "${BUILD_PATH}/client/${SCOPE}"
+          cp -R "./dist/client/${SCOPE}" "${BUILD_PATH}/client/${SCOPE}"
+          if [[ -d "./dist/client/_astro" ]]; then
+            rm -rf "${BUILD_PATH}/client/_astro"
+            cp -R "./dist/client/_astro" "${BUILD_PATH}/client/_astro"
+          fi
+        else
+          echo "Scoped output ./dist/client/${SCOPE} not found; falling back to full deploy."
+          find "${BUILD_PATH}" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+          cp -R ./dist/. "${BUILD_PATH}/"
+        fi
+      else
         find "${BUILD_PATH}" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
         cp -R ./dist/. "${BUILD_PATH}/"
       fi
-    else
-      find "${BUILD_PATH}" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
-      cp -R ./dist/. "${BUILD_PATH}/"
     fi
 
     if [[ "$TARGET" == "production" ]]; then
-      echo "$(date -u +%Y%m%dT%H%M%SZ)" > "${BUILD_PATH}/.deploy-version"
+      STAGING_UPL="${STAGING_UPLOADS_DIR:-}"
+      PROD_UPLOADS="${PRODUCTION_UPLOADS_PATH:-}"
+      if [[ -n "$STAGING_UPL" && -d "$STAGING_UPL" && -n "$PROD_UPLOADS" ]]; then
+        echo "Syncing uploads to production..."
+        mkdir -p "$PROD_UPLOADS"
+        cp -Ru "$STAGING_UPL/." "$PROD_UPLOADS/"
+        echo "Uploads synced."
+      fi
       echo "Warming production caches..."
       bash "${ORCHESTRATOR_SCRIPT_ROOT:-/orchestrator/scripts}/warm-cache.sh" || echo "Cache warm failed (non-fatal)"
+    elif [[ "$TARGET" == "preview" && "$SCOPE" == "full" ]]; then
+      if ! build_production_candidate_archive; then
+        echo "Production promotion candidate build failed; preview deploy will continue without fast-promotion candidate."
+      fi
     fi
 
 else

@@ -30,6 +30,26 @@ const ARCHIVE_DIR = path.resolve(WORKDIR, 'build-archives');
 
 const PUSH_EXCLUDE = new Set(['node_modules', '.astro', 'dist', 'build-archives', '.git', '.env']);
 
+async function syncDelete(src, dest) {
+  let destEntries;
+  try {
+    destEntries = await fs.promises.readdir(dest, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of destEntries) {
+    if (PUSH_EXCLUDE.has(entry.name)) continue;
+    const destPath = path.join(dest, entry.name);
+    const srcPath = path.join(src, entry.name);
+    const srcExists = await fs.promises.access(srcPath).then(() => true).catch(() => false);
+    if (!srcExists) {
+      await fs.promises.rm(destPath, { recursive: true, force: true });
+    } else if (entry.isDirectory()) {
+      await syncDelete(srcPath, destPath);
+    }
+  }
+}
+
 const DEV_OPS = {
   '/dev-tools/copy-media-to-staging': {
     key: 'copyMediaToStagingFromDev',
@@ -74,6 +94,10 @@ const DEV_OPS = {
           force: true,
           filter: (src) => !PUSH_EXCLUDE.has(path.basename(src)),
         });
+        await syncDelete(WORKDIR, STAGING_WORKDIR);
+        // Clear Vite dep cache so the dev server rebuilds it cleanly after the
+        // bulk file change instead of crashing on a partially-written cache.
+        await fs.promises.rm(path.join(STAGING_WORKDIR, 'node_modules', '.vite'), { recursive: true, force: true });
       } finally {
         try { fs.unlinkSync(sentinelPath); } catch { }
       }
@@ -128,33 +152,31 @@ async function buildJob(target, scope) {
   });
   markStarted(target);
 
-  // --- Preview candidate reuse: if production is triggered and preview is unchanged, restore from archive ---
+  // --- Preview candidate reuse: if production is triggered and preview is unchanged, restore the prebuilt production candidate ---
   if (target === 'production') {
     const candidate = readPreviewCandidate();
     const previewPath = TARGETS['preview'];
     if (candidate && previewPath && fs.existsSync(previewPath) && fs.existsSync(candidate.archivePath)) {
       const currentFingerprint = dirFingerprint(previewPath);
       if (currentFingerprint === candidate.fingerprint) {
-        console.log(`[worker] production: reusing preview candidate archive: ${path.basename(candidate.archivePath)}`);
+        console.log(`[worker] production: restoring prebuilt production candidate: ${path.basename(candidate.archivePath)}`);
         await restoreArchiveToTarget('production', candidate.archivePath, deployBuildPath);
-        const promotedName = path.basename(candidate.archivePath).replace('-preview-', '-production-');
-        const promotedPath = path.join(ARCHIVE_DIR, promotedName);
-        fs.renameSync(candidate.archivePath, promotedPath);
         cleanupOldArchives('production', MAX_BACKUPS);
-        updateStatus('backup', 'production', { archivePath: promotedPath });
-        clearPreviewCandidate();
         updateStatus('deploy', target, { deployBuildPath: resolvedDeployPath });
         setRuntimeState({ status: 'done', target, started: startedAt, finished: Date.now(), exitCode: 0, message: null });
         markDone(target);
-        console.log(`[worker] production deployment completed (from preview candidate)`);
+        console.log('[worker] production deployment completed (from production candidate)');
         return;
       }
-      console.log(`[worker] production: preview candidate fingerprint mismatch — doing full build`);
+      console.log('[worker] production: preview candidate fingerprint mismatch — doing full build');
     }
   }
 
   console.log(`[worker] ${target} executing ${DEPLOY_SCRIPT}`);
   const archiveBefore = new Set(listArchivesForTarget(target));
+  const productionCandidateArchiveBefore = target === 'preview'
+    ? new Set(listArchivesForTarget('production-candidate'))
+    : null;
   const exitCode = await runCommand('bash', [DEPLOY_SCRIPT, target, scope]);
   console.log(`[worker] ${target} script exited with code ${exitCode}`);
 
@@ -192,8 +214,19 @@ async function buildJob(target, scope) {
     const previewPath = TARGETS['preview'];
     if (previewPath && fs.existsSync(previewPath)) {
       const fingerprint = dirFingerprint(previewPath);
-      writePreviewCandidate(archivePath, fingerprint);
-      console.log(`[worker] preview candidate saved: ${createdArchive}`);
+      const candidateArchivesAfter = listArchivesForTarget('production-candidate');
+      const createdProductionCandidateArchive = productionCandidateArchiveBefore
+        ? candidateArchivesAfter.find((name) => !productionCandidateArchiveBefore.has(name))
+        : null;
+      if (createdProductionCandidateArchive) {
+        const candidateArchivePath = path.join(ARCHIVE_DIR, createdProductionCandidateArchive);
+        cleanupOldArchives('production-candidate', 1);
+        writePreviewCandidate(candidateArchivePath, fingerprint, archivePath);
+        console.log(`[worker] preview candidate saved: ${createdProductionCandidateArchive}`);
+      } else {
+        clearPreviewCandidate();
+        console.log('[worker] preview candidate not saved: no production candidate archive created');
+      }
     }
   }
 

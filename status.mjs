@@ -266,9 +266,12 @@ export function readPreviewCandidate() {
   }
 }
 
-export function writePreviewCandidate(archivePath, fingerprint) {
+export function writePreviewCandidate(archivePath, fingerprint, previewArchivePath = '') {
   fs.mkdirSync(ARCHIVE_DIR, { recursive: true });
-  fs.writeFileSync(PREVIEW_CANDIDATE_META, JSON.stringify({ archivePath, fingerprint }, null, 2) + '\n');
+  fs.writeFileSync(
+    PREVIEW_CANDIDATE_META,
+    JSON.stringify({ archivePath, fingerprint, previewArchivePath }, null, 2) + '\n'
+  );
 }
 
 export function clearPreviewCandidate() {

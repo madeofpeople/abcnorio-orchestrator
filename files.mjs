@@ -76,9 +76,46 @@ export async function restoreArchiveToTarget(target, archivePath, deployBuildPat
 
     const entries = fs.readdirSync(resolvedDeployPath, { withFileTypes: true });
     for (const entry of entries) {
-      fs.rmSync(path.join(resolvedDeployPath, entry.name), { recursive: true, force: true });
+      const destinationPath = path.join(resolvedDeployPath, entry.name);
+      if (target === 'production' && entry.name === '.ssr' && entry.isDirectory()) {
+        const ssrEntries = fs.readdirSync(destinationPath, { withFileTypes: true });
+        for (const ssrEntry of ssrEntries) {
+          fs.rmSync(path.join(destinationPath, ssrEntry.name), { recursive: true, force: true });
+        }
+        continue;
+      }
+      fs.rmSync(destinationPath, { recursive: true, force: true });
     }
-    fs.cpSync(extractedRoot, resolvedDeployPath, { recursive: true, force: true });
+
+    const extractedRootEntries = fs.readdirSync(extractedRoot, { withFileTypes: true });
+    for (const entry of extractedRootEntries) {
+      const sourcePath = path.join(extractedRoot, entry.name);
+      const destinationPath = path.join(resolvedDeployPath, entry.name);
+
+      if (target === 'production' && entry.name === '.ssr' && entry.isDirectory()) {
+        fs.mkdirSync(destinationPath, { recursive: true });
+
+        const ssrSourceEntries = fs.readdirSync(sourcePath, { withFileTypes: true });
+        for (const ssrEntry of ssrSourceEntries) {
+          if (ssrEntry.name === '.deploy-version') {
+            continue;
+          }
+          fs.cpSync(
+            path.join(sourcePath, ssrEntry.name),
+            path.join(destinationPath, ssrEntry.name),
+            { recursive: true, force: true }
+          );
+        }
+
+        const sentinelSourcePath = path.join(sourcePath, '.deploy-version');
+        if (fs.existsSync(sentinelSourcePath)) {
+          fs.cpSync(sentinelSourcePath, path.join(destinationPath, '.deploy-version'), { force: true });
+        }
+        continue;
+      }
+
+      fs.cpSync(sourcePath, destinationPath, { recursive: true, force: true });
+    }
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }

@@ -26,7 +26,7 @@ deploy-orchestrator/
 - HTTP server on `ORCHESTRATOR_PORT` (default 4011)
 - Routes: `GET /health`, `GET /status`, `POST /trigger`, `POST /restore`, `POST /delete-backup`, `GET /dev-tools/status`, `POST /dev-tools/*`
 - Auth via Bearer token (`ASTRO_BUILD_TRIGGER_SECRET`) — all routes except `/health`
-- Builds the `buildJob` function: calls `deploy.sh`, handles archive contract, preview candidate reuse
+- Builds the `buildJob` function: calls `deploy.sh`, handles archive contract, and restores a prebuilt production candidate when preview still matches
 - Graceful shutdown on SIGTERM/SIGINT: stops accepting requests, waits for queue to drain
 
 #### **queue.mjs**
@@ -91,15 +91,15 @@ buildJob(target, scope)
        ↓
 setRuntimeState(running) + markStarted(target)
        ↓
-[production only] check preview candidate fingerprint
-       → if match: restore archive, skip full build
+[production only] if preview fingerprint still matches a saved production-candidate archive:
+       restore archive directly to production and skip rebuild
        ↓
 runCommand('bash', [deploy.sh, target, scope])
        ↓
 exit 0: find new archive, cleanup old, updateStatus, markDone
 exit ≠ 0: markFailed, throw
        ↓
-[preview only] save production candidate metadata
+[preview only] if scope=full, save production-candidate archive metadata
 ```
 ### 4. Graceful Shutdown
 
@@ -172,7 +172,7 @@ Cleanup runs after each successful build once the archive is discovered, before 
 `MAX_BACKUPS` determined how many backups are saved.
 
 ### Preview Candidate Lifecycle
-After a successful preview build, fingerprint + archive path saved to `build-archives/.production-preview-candidate.meta`. On next production trigger, if fingerprint matches, we pass the pre built preview, rather than running a new build.
+After a successful full preview build, the worker runs one extra production-mode build, archives it as `abcnorio-astro-production-candidate-*.zip`, and writes its path plus the current preview fingerprint to `build-archives/.production-preview-candidate.meta`. On the next production trigger, if the current preview fingerprint still matches, the orchestrator restores that prebuilt production-candidate archive instead of running another full production build.
 
 ### Queue Persistence
 Jobs not yet running are lost on restart. Retriggering is cheap — WP plugin will re-enqueue on next save.
