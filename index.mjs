@@ -23,14 +23,28 @@ const SECRET = process.env.ASTRO_BUILD_TRIGGER_SECRET || '';
 const ALLOW_MANUAL_TRIGGER = process.env.ORCHESTRATOR_ALLOW_MANUAL_TRIGGER !== '0';
 const MAX_BACKUPS = Number(process.env.MAX_BACKUPS || 12);
 
-const WORKDIR = process.env.ASTRO_SITE_ROOT || '/astro-site';
+const SOURCE_ROOT = process.env.ASTRO_SITE_ROOT || '/astro-site';
+const WORKDIR = process.env.ASTRO_BUILD_WORKDIR || SOURCE_ROOT;
 const STAGING_WORKDIR = process.env.ASTRO_STAGING_SITE_ROOT || '';
 const SCRIPT_ROOT = process.env.ORCHESTRATOR_SCRIPT_ROOT || '/orchestrator/scripts';
-const ARCHIVE_DIR = path.resolve(WORKDIR, 'build-archives');
+const ARCHIVE_DIR = process.env.ASTRO_BUILD_ARCHIVE_DIR
+  ? path.resolve(process.env.ASTRO_BUILD_ARCHIVE_DIR)
+  : path.resolve(WORKDIR, 'build-archives');
 
 const PUSH_EXCLUDE = new Set(['node_modules', '.astro', 'dist', 'build-archives', '.git', '.env']);
+const BUILD_SYNC_EXCLUDE = new Set(['node_modules', '.astro', 'dist', 'build-archives', '.git']);
 
-async function syncDelete(src, dest) {
+async function prepareBuildWorkdir(src, dest) {
+  await fs.promises.mkdir(dest, { recursive: true });
+  await fs.promises.cp(src, dest, {
+    recursive: true,
+    force: true,
+    filter: (sourcePath) => !BUILD_SYNC_EXCLUDE.has(path.basename(sourcePath)),
+  });
+  await syncDelete(src, dest, BUILD_SYNC_EXCLUDE);
+}
+
+async function syncDelete(src, dest, excludes = PUSH_EXCLUDE) {
   let destEntries;
   try {
     destEntries = await fs.promises.readdir(dest, { withFileTypes: true });
@@ -38,7 +52,7 @@ async function syncDelete(src, dest) {
     return;
   }
   for (const entry of destEntries) {
-    if (PUSH_EXCLUDE.has(entry.name)) continue;
+    if (excludes.has(entry.name)) continue;
     const destPath = path.join(dest, entry.name);
     const srcPath = path.join(src, entry.name);
     const srcExists = await fs.promises.access(srcPath).then(() => true).catch(() => false);
@@ -89,12 +103,12 @@ const DEV_OPS = {
       const sentinelPath = path.join(STAGING_WORKDIR, '.push-in-progress');
       try { fs.writeFileSync(sentinelPath, ''); } catch { }
       try {
-        await fs.promises.cp(WORKDIR, STAGING_WORKDIR, {
+        await fs.promises.cp(SOURCE_ROOT, STAGING_WORKDIR, {
           recursive: true,
           force: true,
           filter: (src) => !PUSH_EXCLUDE.has(path.basename(src)),
         });
-        await syncDelete(WORKDIR, STAGING_WORKDIR);
+        await syncDelete(SOURCE_ROOT, STAGING_WORKDIR);
         // Clear Vite dep cache so the dev server rebuilds it cleanly after the
         // bulk file change instead of crashing on a partially-written cache.
         await fs.promises.rm(path.join(STAGING_WORKDIR, 'node_modules', '.vite'), { recursive: true, force: true });
@@ -171,6 +185,8 @@ async function buildJob(target, scope) {
       console.log('[worker] production: preview candidate fingerprint mismatch — doing full build');
     }
   }
+
+  await prepareBuildWorkdir(SOURCE_ROOT, WORKDIR);
 
   console.log(`[worker] ${target} executing ${DEPLOY_SCRIPT}`);
   const archiveBefore = new Set(listArchivesForTarget(target));

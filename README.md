@@ -36,7 +36,7 @@ deploy-orchestrator/
 - `getQueueStatus()` → `{ status: 'idle'|'running'|'queued', pendingTarget }`
 
 #### **status.mjs**
-- Canonical status file: `build-archives/deployment-status.json`
+- Canonical status file: `build-archives/deployment-status.json` under the build workdir
 - Runtime state for `/status` response: `getRuntimeState`, `setRuntimeState`
 - Per-environment tracking: `lastRequestedAt`, `lastStartedAt`, `lastFinishedAt`, `lastStatus`, `lastError`
 - Build metadata: `currentBuild.{path, hasBuild, updatedAt}`
@@ -153,6 +153,7 @@ curl -X POST http://localhost:4011/restore \
 | `PRODUCTION_BUILD_PATH` | (none) | Output path for production builds |
 | `PREVIEW_BUILD_PATH` | (none) | Output path for preview builds |
 | `ASTRO_SITE_ROOT` | /astro-site | Astro source directory (mount) |
+| `ASTRO_BUILD_WORKDIR` | ASTRO_SITE_ROOT | Writable build scratch/work directory |
 | `ASTRO_STAGING_SITE_ROOT` | (none) | Staging source directory for push ops |
 | `ASTRO_DEPLOYMENT_STATUS_FILE` | (none) | Override status file path |
 | `ORCHESTRATOR_SCRIPT_ROOT` | /orchestrator/scripts | Deploy script location |

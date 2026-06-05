@@ -2,11 +2,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 
-const WORKDIR = process.env.ASTRO_SITE_ROOT || '/astro-site';
-const ARCHIVE_DIR = path.resolve(WORKDIR, 'build-archives');
+const SOURCE_ROOT = process.env.ASTRO_SITE_ROOT || '/astro-site';
+const WORKDIR = process.env.ASTRO_BUILD_WORKDIR || SOURCE_ROOT;
+const ARCHIVE_DIR = process.env.ASTRO_BUILD_ARCHIVE_DIR
+  ? path.resolve(process.env.ASTRO_BUILD_ARCHIVE_DIR)
+  : path.resolve(WORKDIR, 'build-archives');
 const STATUS_FILE = process.env.ASTRO_DEPLOYMENT_STATUS_FILE
   ? path.resolve(process.env.ASTRO_DEPLOYMENT_STATUS_FILE)
-  : path.resolve(WORKDIR, 'build-archives/deployment-status.json');
+  : path.resolve(ARCHIVE_DIR, 'deployment-status.json');
 const PREVIEW_CANDIDATE_META = path.join(ARCHIVE_DIR, '.production-preview-candidate.meta');
 const ENV_KEYS = ['dev', 'staging', 'production', 'preview'];
 

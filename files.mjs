@@ -3,8 +3,11 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import os from 'node:os';
 
-const WORKDIR = process.env.ASTRO_SITE_ROOT || '/astro-site';
-const ARCHIVE_DIR = path.resolve(WORKDIR, 'build-archives');
+const SOURCE_ROOT = process.env.ASTRO_SITE_ROOT || '/astro-site';
+const WORKDIR = process.env.ASTRO_BUILD_WORKDIR || SOURCE_ROOT;
+const ARCHIVE_DIR = process.env.ASTRO_BUILD_ARCHIVE_DIR
+  ? path.resolve(process.env.ASTRO_BUILD_ARCHIVE_DIR)
+  : path.resolve(WORKDIR, 'build-archives');
 
 export function listArchivesForTarget(target) {
   if (!fs.existsSync(ARCHIVE_DIR)) {
