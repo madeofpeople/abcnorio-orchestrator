@@ -31,6 +31,45 @@ const ARCHIVE_DIR = process.env.ASTRO_BUILD_ARCHIVE_DIR
   ? path.resolve(process.env.ASTRO_BUILD_ARCHIVE_DIR)
   : path.resolve(WORKDIR, 'build-archives');
 
+
+const REQUIRED_ENV = [
+  'ASTRO_BUILD_TRIGGER_SECRET',
+  'ASTRO_SITE_ROOT',
+  'ASTRO_BUILD_WORKDIR',
+]
+const DEPLOY_SCRIPT = path.join(SCRIPT_ROOT, 'deploy.sh');
+const REQUIRED_PATHS = [
+  SOURCE_ROOT,
+  WORKDIR,
+  SCRIPT_ROOT,
+  DEPLOY_SCRIPT,
+]
+
+const TARGETS = {
+  production: process.env.PRODUCTION_BUILD_PATH || '',
+  preview: process.env.PREVIEW_BUILD_PATH || '',
+};
+
+assertRequiredEnvVars(REQUIRED_ENV);
+
+assertRequiredPaths(REQUIRED_PATHS);
+
+function assertRequiredEnvVars(varNames) {
+  const missing = varNames.filter((name) => !String(process.env[name] || '').trim());
+  if (missing.length > 0) {
+    console.error(`[startup] FATAL: missing required env vars: ${missing.join(', ')}`);
+    process.exit(1);
+  }
+}
+
+function assertRequiredPaths(pathsToCheck) {
+  const missing = pathsToCheck.filter((targetPath) => !fs.existsSync(targetPath));
+  if (missing.length > 0) {
+    console.error(`[startup] FATAL: missing required paths: ${missing.join(', ')}`);
+    process.exit(1);
+  }
+}
+
 const PUSH_EXCLUDE = new Set(['node_modules', '.astro', 'dist', 'build-archives', '.git', '.env']);
 const BUILD_SYNC_EXCLUDE = new Set(['node_modules', '.astro', 'dist', 'build-archives', '.git']);
 
@@ -118,12 +157,6 @@ const DEV_OPS = {
       return 'Code pushed to staging.';
     },
   },
-};
-
-const DEPLOY_SCRIPT = path.join(SCRIPT_ROOT, 'deploy.sh');
-const TARGETS = {
-  production: process.env.PRODUCTION_BUILD_PATH || '',
-  preview: process.env.PREVIEW_BUILD_PATH || '',
 };
 
 if (!SECRET) {
