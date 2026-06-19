@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-HOST="${PRODUCTION_HOST:-https://abcnorio.itztlacoliuhqui.org}"
+HOST="${PRODUCTION_HOST}"
 
 URLS=(
     "${HOST}/events/listing?date-filter=ongoing-and-upcoming&order=desc"

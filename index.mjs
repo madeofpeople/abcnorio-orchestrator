@@ -70,8 +70,8 @@ function assertRequiredPaths(pathsToCheck) {
   }
 }
 
-const PUSH_EXCLUDE = new Set(['node_modules', '.astro', 'dist', 'build-archives', '.git', '.env']);
-const BUILD_SYNC_EXCLUDE = new Set(['node_modules', '.astro', 'dist', 'build-archives', '.git']);
+const PUSH_EXCLUDE = new Set(['node_modules', '.astro', 'dist', 'build-archives', '.git', '.env', 'abcnorio-webcomponents']);
+const BUILD_SYNC_EXCLUDE = new Set(['node_modules', '.astro', 'dist', 'build-archives', '.git', 'abcnorio-webcomponents']);
 
 async function prepareBuildWorkdir(src, dest) {
   await fs.promises.mkdir(dest, { recursive: true });
@@ -148,6 +148,16 @@ const DEV_OPS = {
           filter: (src) => !PUSH_EXCLUDE.has(path.basename(src)),
         });
         await syncDelete(SOURCE_ROOT, STAGING_WORKDIR);
+
+        // Patch package.json: replace local file: ref with GitHub branch ref
+        // so staging installs abcnorio-webcomponents from the versioned staging branch.
+        const stagingPkgPath = path.join(STAGING_WORKDIR, 'package.json');
+        const stagingPkg = JSON.parse(await fs.promises.readFile(stagingPkgPath, 'utf8'));
+        if (stagingPkg.dependencies?.['abcnorio-webcomponents']?.startsWith('file:')) {
+          stagingPkg.dependencies['abcnorio-webcomponents'] = 'github:madeofpeople/abcnorio-webcomponents#staging';
+          await fs.promises.writeFile(stagingPkgPath, JSON.stringify(stagingPkg, null, 2) + '\n', 'utf8');
+        }
+
         // Clear Vite dep cache so the dev server rebuilds it cleanly after the
         // bulk file change instead of crashing on a partially-written cache.
         await fs.promises.rm(path.join(STAGING_WORKDIR, 'node_modules', '.vite'), { recursive: true, force: true });
