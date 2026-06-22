@@ -283,11 +283,6 @@ const DEV_OPS = {
         // Clear Vite cache for clean rebuild
         await fs.promises.rm(path.join(STAGING_WORKDIR, 'node_modules', '.vite'), { recursive: true, force: true });
         
-        // Restart astro-staging container to pick up new code and deps
-        console.log(`[push-to-staging] restarting astro-staging container`);
-        await runCommand('docker', ['compose', 'restart', 'astro-staging']);
-        console.log(`[push-to-staging] astro-staging restarted`);
-        
         return version ? `Code pushed to staging from approved tag staging-v${version}.` : 'Code pushed to staging from working tree.';
       } finally {
         try { fs.unlinkSync(sentinelPath); } catch { }
