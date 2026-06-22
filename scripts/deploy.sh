@@ -54,10 +54,9 @@ stage_production_ssr_runtime() {
     rm -rf "${temp_runtime_path}"
     mkdir -p "${temp_runtime_path}"
     cp ./package.json "${temp_runtime_path}/package.json"
-    cp ./package-lock.json "${temp_runtime_path}/package-lock.json"
     (
       cd "${temp_runtime_path}"
-      npm ci --omit=dev
+      npm install --omit=dev --package-lock=false
     )
     cp -R ./dist/server "${temp_runtime_path}/server"
     cp -R ./dist/client "${temp_runtime_path}/client"
@@ -80,27 +79,12 @@ stage_production_ssr_runtime() {
     rm -rf "${temp_runtime_path}"
 }
 
-  build_production_candidate_archive() {
-    local candidate_dir
-
-    candidate_dir="$(mktemp -d)"
-    echo "Building production promotion candidate..."
-
-    rm -rf ./dist
-    MODE=production SCOPE=full BUILD_CACHE_TTL_MS=0 npm run build:site
-
-    mkdir -p "${candidate_dir}/client"
-    cp -R ./dist/client/. "${candidate_dir}/client/"
-    stage_production_ssr_runtime "${candidate_dir}/.ssr"
-
-    BACKUP_SOURCE_DIR="${candidate_dir}" BACKUP_TARGET="production-candidate" bash "${ORCHESTRATOR_SCRIPT_ROOT:-/orchestrator/scripts}/backup-build.sh"
-    rm -rf "${candidate_dir}"
-  }
-
 if [ -n "${BUILD_PATH}" ] && [ -d "${BUILD_PATH}" ]; then
-    if [[ ! -d node_modules ]]; then
-      npm install
-    fi
+  rm -rf ./abcnorio-webcomponents
+  cp -R /abcnorio-webcomponents ./abcnorio-webcomponents
+  rm -rf ./abcnorio-webcomponents/node_modules
+  npm pkg set dependencies.abcnorio-webcomponents='file:./abcnorio-webcomponents'
+    npm install --package-lock=false
     rm -rf ./dist
     export MODE
     export SCOPE
@@ -109,7 +93,7 @@ if [ -n "${BUILD_PATH}" ] && [ -d "${BUILD_PATH}" ]; then
     export BACKUP_SOURCE_DIR="${BUILD_PATH}"
     export ASTRO_BUILD_BACKUP=1
     bash "${ORCHESTRATOR_SCRIPT_ROOT:-/orchestrator/scripts}/backup-build.sh"
-    npm run build:site
+    npm run build
 
     if [[ "$TARGET" == "production" ]]; then
       mkdir -p "${BUILD_PATH}/client"
@@ -165,10 +149,6 @@ if [ -n "${BUILD_PATH}" ] && [ -d "${BUILD_PATH}" ]; then
       fi
       echo "Warming production caches..."
       bash "${ORCHESTRATOR_SCRIPT_ROOT:-/orchestrator/scripts}/warm-cache.sh" || echo "Cache warm failed (non-fatal)"
-    elif [[ "$TARGET" == "preview" && "$SCOPE" == "full" ]]; then
-      if ! build_production_candidate_archive; then
-        echo "Production promotion candidate build failed; preview deploy will continue without fast-promotion candidate."
-      fi
     fi
 
 else

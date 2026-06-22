@@ -24,7 +24,7 @@ deploy-orchestrator/
 
 #### **index.mjs**
 - HTTP server on `ORCHESTRATOR_PORT` (default 4011)
-- Routes: `GET /health`, `GET /status`, `POST /trigger`, `POST /restore`, `POST /delete-backup`, `GET /dev-tools/status`, `POST /dev-tools/*`
+- Routes: `GET /health`, `GET /status`, `POST /trigger`, `POST /restore`, `GET /dev-tools/status`, `POST /dev-tools/*`
 - Auth via Bearer token (`ASTRO_BUILD_TRIGGER_SECRET`) — all routes except `/health`
 - Builds the `buildJob` function: calls `deploy.sh`, handles archive contract, and restores a prebuilt production candidate when preview still matches
 - Graceful shutdown on SIGTERM/SIGINT: stops accepting requests, waits for queue to drain
@@ -91,15 +91,13 @@ buildJob(target, scope)
        ↓
 setRuntimeState(running) + markStarted(target)
        ↓
-[production only] if preview fingerprint still matches a saved production-candidate archive:
-       restore archive directly to production and skip rebuild
-       ↓
 runCommand('bash', [deploy.sh, target, scope])
        ↓
-exit 0: find new archive, cleanup old, updateStatus, markDone
+exit 0: find new archive, cleanup old, updateStatus, runSmokeChecks
 exit ≠ 0: markFailed, throw
        ↓
-[preview only] if scope=full, save production-candidate archive metadata
+smoke pass: markDone
+smoke fail: markFailed, throw
 ```
 ### 4. Graceful Shutdown
 
@@ -150,6 +148,9 @@ curl -X POST http://localhost:4011/restore \
 | `ASTRO_BUILD_TRIGGER_SECRET` | (required) | Bearer token for auth |
 | `ORCHESTRATOR_ALLOW_MANUAL_TRIGGER` | 1 | Allow `source=manual` to `/trigger` |
 | `MAX_BACKUPS` | 12 | Archive cleanup threshold per target |
+| `PRODUCTION_HOST` | (none) | Public URL for production HTTP smoke probe (required; production gate fails if unset) |
+| `PREVIEW_HOST` | (none) | Public URL for preview HTTP smoke probe (optional; skipped if unset) |
+| `ORCHESTRATOR_SMOKE_HTTP_TIMEOUT_MS` | 10000 | Timeout in ms for each HTTP smoke probe |
 | `PRODUCTION_BUILD_PATH` | (none) | Output path for production builds |
 | `PREVIEW_BUILD_PATH` | (none) | Output path for preview builds |
 | `ASTRO_SITE_ROOT` | /astro-site | Astro source directory (mount) |
@@ -171,9 +172,6 @@ Tests use `node --test`. Coverage: archive listing, validation, path traversal r
 ### Max Backups Cleanup
 Cleanup runs after each successful build once the archive is discovered, before `markDone`. 
 `MAX_BACKUPS` determined how many backups are saved.
-
-### Preview Candidate Lifecycle
-After a successful full preview build, the worker runs one extra production-mode build, archives it as `abcnorio-astro-production-candidate-*.zip`, and writes its path plus the current preview fingerprint to `build-archives/.production-preview-candidate.meta`. On the next production trigger, if the current preview fingerprint still matches, the orchestrator restores that prebuilt production-candidate archive instead of running another full production build.
 
 ### Queue Persistence
 Jobs not yet running are lost on restart. Retriggering is cheap — WP plugin will re-enqueue on next save.

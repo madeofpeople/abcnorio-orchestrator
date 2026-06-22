@@ -1,6 +1,5 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { createHash } from 'node:crypto';
 
 const SOURCE_ROOT = process.env.ASTRO_SITE_ROOT || '/astro-site';
 const WORKDIR = process.env.ASTRO_BUILD_WORKDIR || SOURCE_ROOT;
@@ -10,7 +9,6 @@ const ARCHIVE_DIR = process.env.ASTRO_BUILD_ARCHIVE_DIR
 const STATUS_FILE = process.env.ASTRO_DEPLOYMENT_STATUS_FILE
   ? path.resolve(process.env.ASTRO_DEPLOYMENT_STATUS_FILE)
   : path.resolve(ARCHIVE_DIR, 'deployment-status.json');
-const PREVIEW_CANDIDATE_META = path.join(ARCHIVE_DIR, '.production-preview-candidate.meta');
 const ENV_KEYS = ['dev', 'staging', 'production', 'preview'];
 
 function defaultRuntimeState() {
@@ -40,6 +38,7 @@ function defaultEnvStatus() {
     },
     latestBackup: null,
     backups: [],
+    lastSmoke: null,
   };
 }
 
@@ -198,6 +197,16 @@ export function updateStatus(action, target, payload) {
     recordBackup(status, target, payload.archivePath);
   } else if (action === 'deploy') {
     recordDeploy(status, target, payload.deployBuildPath);
+  } else if (action === 'smoke') {
+    const envStatus = ensureEnvStatus(status, target);
+    envStatus.lastSmoke = {
+      status: payload.passed ? 'passed' : 'failed',
+      checkedAt: new Date().toISOString(),
+      durationMs: payload.durationMs,
+      requiredFailed: payload.requiredFailed,
+      optionalFailed: payload.optionalFailed,
+      checks: payload.checks,
+    };
   } else {
     throw new Error(`unknown status action: ${action}`);
   }
@@ -221,62 +230,5 @@ export function getRuntimeState() {
   return status.runtime;
 }
 
-export function removeBackupFromStatus(target, name) {
-  updateEnv(target, (env) => {
-    env.backups = env.backups.filter((b) => b?.name !== name);
-    if (env.latestBackup?.name === name) {
-      env.latestBackup = env.backups[0] ?? null;
-    }
-  });
-}
 
-/**
- * Compute a lightweight fingerprint of a directory: sorted list of relative paths + sizes.
- * Not cryptographically strong but sufficient to detect if the preview dir changed since
- * the candidate was captured.
- * @param {string} dirPath
- * @returns {string}
- */
-export function dirFingerprint(dirPath) {
-  const hash = createHash('sha256');
 
-  function walk(dir, prefix = '') {
-    const entries = fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
-    for (const entry of entries) {
-      const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
-      if (entry.isDirectory()) {
-        walk(path.join(dir, entry.name), rel);
-      } else {
-        const stat = fs.statSync(path.join(dir, entry.name));
-        hash.update(`${rel}:${stat.size}\n`);
-      }
-    }
-  }
-
-  walk(dirPath);
-  return hash.digest('hex');
-}
-
-export function readPreviewCandidate() {
-  if (!fs.existsSync(PREVIEW_CANDIDATE_META)) return null;
-  try {
-    const raw = fs.readFileSync(PREVIEW_CANDIDATE_META, 'utf8');
-    const candidate = JSON.parse(raw);
-    if (!candidate.archivePath || !candidate.fingerprint) return null;
-    return candidate;
-  } catch {
-    return null;
-  }
-}
-
-export function writePreviewCandidate(archivePath, fingerprint, previewArchivePath = '') {
-  fs.mkdirSync(ARCHIVE_DIR, { recursive: true });
-  fs.writeFileSync(
-    PREVIEW_CANDIDATE_META,
-    JSON.stringify({ archivePath, fingerprint, previewArchivePath }, null, 2) + '\n'
-  );
-}
-
-export function clearPreviewCandidate() {
-  try { fs.unlinkSync(PREVIEW_CANDIDATE_META); } catch { /* not present */ }
-}
