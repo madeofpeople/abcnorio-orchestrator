@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { enqueue, getQueueStatus } from './queue.mjs';
-import { devToolsState, startDevOp, copyMediaFiles, dumpDatabase, uploads, db } from './dev-tools.mjs';
+import { devToolsState, startDevOp, copyMediaFiles, dumpDatabase, uploads, db, assertUploadsContract } from './dev-tools.mjs';
 import { getAuthToken, readJsonBody } from './http.mjs';
 import {
   listArchivesForTarget,
@@ -57,6 +57,8 @@ const SMOKE_HTTP_TIMEOUT_MS = Number(process.env.ORCHESTRATOR_SMOKE_HTTP_TIMEOUT
 assertRequiredEnvVars(REQUIRED_ENV);
 
 assertRequiredPaths(REQUIRED_PATHS);
+
+assertUploadsContract();
 
 function assertRequiredEnvVars(varNames) {
   const missing = varNames.filter((name) => !String(process.env[name] || '').trim());

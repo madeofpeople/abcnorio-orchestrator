@@ -6,6 +6,51 @@ export const uploads = {
   dev: process.env.DEV_UPLOADS_DIR || '/dev-uploads',
 };
 
+const SHARED_UID = Number(process.env.PROJECT_UID || 1000);
+const SHARED_GID = Number(process.env.PROJECT_GID || 2000);
+
+function assertUploadsPathContract(label, uploadsPath) {
+  let stat;
+  try {
+    stat = fs.statSync(uploadsPath);
+  } catch (error) {
+    throw new Error(`[startup] FATAL: ${label} uploads path missing: ${uploadsPath} (${error.message})`);
+  }
+
+  if (!stat.isDirectory()) {
+    throw new Error(`[startup] FATAL: ${label} uploads path is not a directory: ${uploadsPath}`);
+  }
+
+  const isRootlessMapped = stat.uid === 0;
+
+  if (!isRootlessMapped && stat.uid !== SHARED_UID) {
+    throw new Error(`[startup] FATAL: ${label} uploads UID is ${stat.uid} (expected ${SHARED_UID}) at ${uploadsPath}`);
+  }
+
+  if (!isRootlessMapped && stat.gid !== SHARED_GID) {
+    throw new Error(`[startup] FATAL: ${label} uploads GID is ${stat.gid} (expected ${SHARED_GID}) at ${uploadsPath}`);
+  }
+
+  const mode = stat.mode & 0o7777;
+  if ((mode & 0o2000) === 0) {
+    throw new Error(`[startup] FATAL: ${label} uploads dir missing setgid bit (expected mode 2775) at ${uploadsPath}`);
+  }
+
+  if ((mode & 0o0020) === 0) {
+    throw new Error(`[startup] FATAL: ${label} uploads dir is not group-writable at ${uploadsPath}`);
+  }
+}
+
+export function assertUploadsContract() {
+  const groups = process.getgroups();
+  if (!groups.includes(SHARED_GID)) {
+    throw new Error(`[startup] FATAL: process is missing required supplemental GID ${SHARED_GID}`);
+  }
+
+  assertUploadsPathContract('dev', uploads.dev);
+  assertUploadsPathContract('staging', uploads.staging);
+}
+
 export const db = {
   staging: {
     host: process.env.STAGING_DB_HOST || 'mariadb',
