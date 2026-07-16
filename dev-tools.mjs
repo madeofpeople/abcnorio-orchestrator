@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import path from 'node:path';
 import { spawn } from 'node:child_process';
 
 export const uploads = {
@@ -8,6 +9,13 @@ export const uploads = {
 
 const SHARED_UID = Number(process.env.PROJECT_UID || 1000);
 const SHARED_GID = Number(process.env.PROJECT_GID || 2000);
+const MAX_MEDIA_BACKUPS = Math.max(1, Number(process.env.MAX_MEDIA_BACKUPS || 2));
+const BASE_ARCHIVE_DIR = process.env.ASTRO_BUILD_ARCHIVE_DIR
+  ? path.resolve(process.env.ASTRO_BUILD_ARCHIVE_DIR)
+  : path.resolve(process.env.ASTRO_BUILD_WORKDIR || '/astro-build', 'build-archives');
+const MEDIA_ARCHIVE_DIR = process.env.ASTRO_BUILD_MEDIA_ARCHIVE_DIR
+  ? path.resolve(process.env.ASTRO_BUILD_MEDIA_ARCHIVE_DIR)
+  : path.resolve(BASE_ARCHIVE_DIR, 'media');
 
 function assertUploadsPathContract(label, uploadsPath) {
   let stat;
@@ -66,26 +74,39 @@ export const db = {
   },
 };
 
+const idleDevToolState = () => ({ status: 'idle', started: null, finished: null, message: null });
+
 export const devToolsState = {
-  push: { status: 'idle', started: null, finished: null, message: null },
-  copyMediaFromStagingToDev: { status: 'idle', started: null, finished: null, message: null },
-  pullFromStagingToDev: { status: 'idle', started: null, finished: null, message: null },
-  copyMediaToStagingFromDev: { status: 'idle', started: null, finished: null, message: null },
-  pullDBFromDevToStaging: { status: 'idle', started: null, finished: null, message: null },
+  push: idleDevToolState(),
+  copyMediaFromStagingToDev: idleDevToolState(),
+  pullFromStagingToDev: idleDevToolState(),
+  copyMediaToStagingFromDev: idleDevToolState(),
+  pullDBFromDevToStaging: idleDevToolState(),
+  backupMediaDev: idleDevToolState(),
+  backupMediaStaging: idleDevToolState(),
 };
+
+function setDevToolState(key, status, started, message = null) {
+  devToolsState[key] = {
+    status,
+    started,
+    finished: status === 'running' ? null : Date.now(),
+    message,
+  };
+}
 
 export function startDevOp(key, label, asyncFn) {
   if (devToolsState[key].status === 'running') return false;
   const startedAt = Date.now();
-  devToolsState[key] = { status: 'running', started: startedAt, finished: null, message: null };
+  setDevToolState(key, 'running', startedAt);
   console.log(`[${label}] started`);
   asyncFn()
     .then((message) => {
-      devToolsState[key] = { status: 'done', started: startedAt, finished: Date.now(), message };
+      setDevToolState(key, 'done', startedAt, message);
       console.log(`[${label}] complete`);
     })
     .catch((err) => {
-      devToolsState[key] = { status: 'failed', started: startedAt, finished: Date.now(), message: err.message };
+      setDevToolState(key, 'failed', startedAt, err.message);
       console.error(`[${label}] failed: ${err.message}`);
     });
   return true;
@@ -93,6 +114,74 @@ export function startDevOp(key, label, asyncFn) {
 
 export function copyMediaFiles(src, dest) {
   return fs.promises.cp(src, dest, { recursive: true, force: false, errorOnExist: false });
+}
+
+function cleanupOldMediaBackups(target) {
+  if (!fs.existsSync(MEDIA_ARCHIVE_DIR)) {
+    return;
+  }
+
+  const prefix = `abcnorio-media-${target}-`;
+  const names = fs.readdirSync(MEDIA_ARCHIVE_DIR)
+    .filter((name) => name.startsWith(prefix) && name.endsWith('.zip'));
+
+  if (names.length <= MAX_MEDIA_BACKUPS) {
+    return;
+  }
+
+  const sortedByMtime = names
+    .map((name) => {
+      const fullPath = path.join(MEDIA_ARCHIVE_DIR, name);
+      return { name, fullPath, mtime: fs.statSync(fullPath).mtimeMs };
+    })
+    .sort((a, b) => b.mtime - a.mtime);
+
+  for (let i = MAX_MEDIA_BACKUPS; i < sortedByMtime.length; i += 1) {
+    try {
+      fs.unlinkSync(sortedByMtime[i].fullPath);
+    } catch (error) {
+      console.warn(`[backup-media-${target}] failed to delete old archive ${sortedByMtime[i].name}: ${error.message}`);
+    }
+  }
+}
+
+export function createMediaBackupArchive(sourceDir, target) {
+  if (!fs.existsSync(sourceDir) || !fs.statSync(sourceDir).isDirectory()) {
+    return Promise.reject(new Error(`uploads source not found: ${sourceDir}`));
+  }
+
+  fs.mkdirSync(MEDIA_ARCHIVE_DIR, { recursive: true });
+
+  const ts = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15);
+  const archiveName = `abcnorio-media-${target}-${ts}.zip`;
+  const archivePath = path.join(MEDIA_ARCHIVE_DIR, archiveName);
+  const parentDir = path.dirname(sourceDir);
+  const baseName = path.basename(sourceDir);
+
+  return new Promise((resolve, reject) => {
+    const zipProc = spawn('zip', ['-qr', archivePath, baseName], {
+      cwd: parentDir,
+      env: process.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    let stderr = '';
+    zipProc.stderr.on('data', (d) => { stderr += d.toString(); });
+
+    zipProc.on('close', (code) => {
+      if (code !== 0) {
+        reject(new Error(`zip failed (${code}): ${stderr.trim()}`));
+        return;
+      }
+
+      cleanupOldMediaBackups(target);
+      resolve(archiveName);
+    });
+
+    zipProc.on('error', (error) => {
+      reject(new Error(`zip process error: ${error.message}`));
+    });
+  });
 }
 
 export function dumpDatabase(src, dest) {

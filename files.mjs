@@ -5,18 +5,21 @@ import os from 'node:os';
 
 const SOURCE_ROOT = process.env.ASTRO_SITE_ROOT || '/astro-site';
 const WORKDIR = process.env.ASTRO_BUILD_WORKDIR || SOURCE_ROOT;
-const ARCHIVE_DIR = process.env.ASTRO_BUILD_ARCHIVE_DIR
+const BASE_ARCHIVE_DIR = process.env.ASTRO_BUILD_ARCHIVE_DIR
   ? path.resolve(process.env.ASTRO_BUILD_ARCHIVE_DIR)
   : path.resolve(WORKDIR, 'build-archives');
+const STATIC_ARCHIVE_DIR = process.env.ASTRO_BUILD_STATIC_ARCHIVE_DIR
+  ? path.resolve(process.env.ASTRO_BUILD_STATIC_ARCHIVE_DIR)
+  : path.resolve(BASE_ARCHIVE_DIR, 'static-backup');
 
 export function listArchivesForTarget(target) {
-  if (!fs.existsSync(ARCHIVE_DIR)) {
+  if (!fs.existsSync(STATIC_ARCHIVE_DIR)) {
     return [];
   }
 
   const prefix = `abcnorio-astro-${target}-`;
   return fs
-    .readdirSync(ARCHIVE_DIR)
+    .readdirSync(STATIC_ARCHIVE_DIR)
     .filter((name) => name.startsWith(prefix) && name.endsWith('.zip'));
 }
 
@@ -32,8 +35,8 @@ export function resolveArchiveForTarget(target, requestedName) {
     throw new Error('invalid archive');
   }
 
-  const archivePath = path.resolve(ARCHIVE_DIR, name);
-  if (!archivePath.startsWith(`${ARCHIVE_DIR}${path.sep}`)) {
+  const archivePath = path.resolve(STATIC_ARCHIVE_DIR, name);
+  if (!archivePath.startsWith(`${STATIC_ARCHIVE_DIR}${path.sep}`)) {
     throw new Error('invalid archive');
   }
 
@@ -134,7 +137,7 @@ export function cleanupOldArchives(target, maxKeep) {
 
   const sortedByMtime = names
     .map((name) => {
-      const fullPath = path.join(ARCHIVE_DIR, name);
+      const fullPath = path.join(STATIC_ARCHIVE_DIR, name);
       return { name, fullPath, mtime: fs.statSync(fullPath).mtimeMs };
     })
     .sort((a, b) => b.mtime - a.mtime);

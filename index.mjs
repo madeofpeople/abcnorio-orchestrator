@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { enqueue, getQueueStatus } from './queue.mjs';
-import { devToolsState, startDevOp, copyMediaFiles, dumpDatabase, uploads, db, assertUploadsContract } from './dev-tools.mjs';
+import { devToolsState, startDevOp, copyMediaFiles, createMediaBackupArchive, dumpDatabase, uploads, db, assertUploadsContract } from './dev-tools.mjs';
 import { getAuthToken, readJsonBody } from './http.mjs';
 import {
   listArchivesForTarget,
@@ -24,12 +24,62 @@ const ALLOW_MANUAL_TRIGGER = process.env.ORCHESTRATOR_ALLOW_MANUAL_TRIGGER !== '
 const MAX_BACKUPS = Number(process.env.MAX_BACKUPS || 12);
 
 const SOURCE_ROOT = process.env.ASTRO_SITE_ROOT || '/astro-site';
+const SOURCE_GIT_ROOT = process.env.ASTRO_SITE_GIT_ROOT || SOURCE_ROOT;
+const SOURCE_GIT_SUBDIR = (process.env.ASTRO_SITE_GIT_SUBDIR || '').replace(/^\/+|\/+$/g, '');
 const WORKDIR = process.env.ASTRO_BUILD_WORKDIR || SOURCE_ROOT;
 const STAGING_WORKDIR = process.env.ASTRO_STAGING_SITE_ROOT || '';
 const SCRIPT_ROOT = process.env.ORCHESTRATOR_SCRIPT_ROOT || '/orchestrator/scripts';
-const ARCHIVE_DIR = process.env.ASTRO_BUILD_ARCHIVE_DIR
+const BASE_ARCHIVE_DIR = process.env.ASTRO_BUILD_ARCHIVE_DIR
   ? path.resolve(process.env.ASTRO_BUILD_ARCHIVE_DIR)
   : path.resolve(WORKDIR, 'build-archives');
+const STATIC_ARCHIVE_DIR = process.env.ASTRO_BUILD_STATIC_ARCHIVE_DIR
+  ? path.resolve(process.env.ASTRO_BUILD_STATIC_ARCHIVE_DIR)
+  : path.resolve(BASE_ARCHIVE_DIR, 'static-backup');
+const MEDIA_ARCHIVE_DIR = process.env.ASTRO_BUILD_MEDIA_ARCHIVE_DIR
+  ? path.resolve(process.env.ASTRO_BUILD_MEDIA_ARCHIVE_DIR)
+  : path.resolve(BASE_ARCHIVE_DIR, 'media');
+
+function listMediaBackups(target) {
+  if (!fs.existsSync(MEDIA_ARCHIVE_DIR)) {
+    return [];
+  }
+
+  const prefix = `abcnorio-media-${target}-`;
+  return fs.readdirSync(MEDIA_ARCHIVE_DIR)
+    .filter((name) => name.startsWith(prefix) && name.endsWith('.zip'))
+    .map((name) => {
+      const fullPath = path.join(MEDIA_ARCHIVE_DIR, name);
+      return {
+        name,
+        mtime: fs.statSync(fullPath).mtimeMs,
+      };
+    })
+    .sort((a, b) => b.mtime - a.mtime);
+}
+
+function resolveMediaBackupArchive(target, requestedName) {
+  const name = String(requestedName || '').trim();
+  const prefix = `abcnorio-media-${target}-`;
+
+  if (!name || !name.startsWith(prefix) || !name.endsWith('.zip')) {
+    throw new Error('invalid archive');
+  }
+
+  if (name.includes('/') || name.includes('\\')) {
+    throw new Error('invalid archive');
+  }
+
+  const archivePath = path.resolve(MEDIA_ARCHIVE_DIR, name);
+  if (!archivePath.startsWith(`${MEDIA_ARCHIVE_DIR}${path.sep}`)) {
+    throw new Error('invalid archive');
+  }
+
+  if (!fs.existsSync(archivePath) || !fs.statSync(archivePath).isFile()) {
+    throw new Error('archive not found');
+  }
+
+  return archivePath;
+}
 
 
 const REQUIRED_ENV = [
@@ -40,6 +90,7 @@ const REQUIRED_ENV = [
 const DEPLOY_SCRIPT = path.join(SCRIPT_ROOT, 'deploy.sh');
 const REQUIRED_PATHS = [
   SOURCE_ROOT,
+  SOURCE_GIT_ROOT,
   WORKDIR,
   SCRIPT_ROOT,
   DEPLOY_SCRIPT,
@@ -109,11 +160,17 @@ async function syncDelete(src, dest, excludes = PUSH_EXCLUDE) {
   }
 }
 
-// Resolve git tag to commit SHA in SOURCE_ROOT (site-dev)
-async function resolveGitTag(tag) {
+async function clearDirectoryContents(dir) {
+  await fs.promises.mkdir(dir, { recursive: true });
+  const entries = await fs.promises.readdir(dir);
+  await Promise.all(entries.map((entry) => fs.promises.rm(path.join(dir, entry), { recursive: true, force: true })));
+}
+
+// Resolve git ref (branch, tag, or commit-ish) to commit SHA in SOURCE_GIT_ROOT.
+async function resolveGitRef(ref) {
   return new Promise((resolve, reject) => {
-    const proc = spawn('git', ['rev-list', '-n', '1', tag], {
-      cwd: SOURCE_ROOT,
+    const proc = spawn('git', ['rev-parse', '--verify', `${ref}^{commit}`], {
+      cwd: SOURCE_GIT_ROOT,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let stdout = '';
@@ -124,7 +181,7 @@ async function resolveGitTag(tag) {
       if (code === 0) {
         resolve(stdout.trim());
       } else {
-        reject(new Error(`Failed to resolve tag ${tag}: ${stderr.trim()}`));
+        reject(new Error(`Failed to resolve git ref ${ref}: ${stderr.trim()}`));
       }
     });
     proc.on('error', (err) => {
@@ -136,14 +193,25 @@ async function resolveGitTag(tag) {
 // Export specific git commit tree to target directory via git archive
 async function exportGitCommit(commitSha, targetDir) {
   return new Promise((resolve, reject) => {
+    const archiveArgs = ['archive', '--format=tar', commitSha];
+    if (SOURCE_GIT_SUBDIR) {
+      archiveArgs.push(SOURCE_GIT_SUBDIR);
+    }
+
     // Use tar format to preserve file permissions and symlinks
-    const tarProc = spawn('git', ['archive', '--format=tar', commitSha], {
-      cwd: SOURCE_ROOT,
+    const tarProc = spawn('git', archiveArgs, {
+      cwd: SOURCE_GIT_ROOT,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
-    
+
+    const stripComponents = SOURCE_GIT_SUBDIR ? SOURCE_GIT_SUBDIR.split('/').length : 0;
+    const extractArgs = ['-xf', '-', '-C', targetDir];
+    if (stripComponents > 0) {
+      extractArgs.push(`--strip-components=${stripComponents}`);
+    }
+
     // Extract tar stream directly to target directory
-    const tarPath = spawn('tar', ['-xf', '-', '-C', targetDir], {
+    const tarPath = spawn('tar', extractArgs, {
       stdio: [tarProc.stdout, 'pipe', 'pipe'],
     });
     
@@ -204,6 +272,16 @@ const DEV_OPS = {
     label: 'copy-media-to-dev',
     run: () => copyMediaFiles(uploads.staging, uploads.dev).then(() => 'Media copied to dev.'),
   },
+  '/dev-tools/backup-media-dev': {
+    key: 'backupMediaDev',
+    label: 'backup-media-dev',
+    run: () => createMediaBackupArchive(uploads.dev, 'dev').then((name) => `Dev media backup created: ${name}`),
+  },
+  '/dev-tools/backup-media-staging': {
+    key: 'backupMediaStaging',
+    label: 'backup-media-staging',
+    run: () => createMediaBackupArchive(uploads.staging, 'staging').then((name) => `Staging media backup created: ${name}`),
+  },
   '/dev-tools/pull-from-dev': {
     key: 'pullDBFromDevToStaging',
     label: 'pull-from-dev',
@@ -224,42 +302,24 @@ const DEV_OPS = {
       return 'Staging data pulled to dev.';
     },
   },
-  '/dev-tools/push-to-staging': (body = {}) => ({
+  '/dev-tools/push-to-staging': () => ({
     key: 'push',
     label: 'push-to-staging',
     requiresStaging: true,
     run: async () => {
-      const version = String(body.version || '').trim();
       const sentinelPath = path.join(STAGING_WORKDIR, '.push-in-progress');
       
       try { fs.writeFileSync(sentinelPath, ''); } catch { }
       try {
-        let commitSha;
-        
-        // If version specified, resolve git tag; otherwise use working tree
-        if (version) {
-          const tag = `staging-v${version}`;
-          console.log(`[push-to-staging] resolving tag ${tag}`);
-          commitSha = await resolveGitTag(tag);
-          console.log(`[push-to-staging] tag ${tag} → ${commitSha}`);
-          
-          // Clear staging workdir completely for clean export
-          await fs.promises.rm(STAGING_WORKDIR, { recursive: true, force: true });
-          await fs.promises.mkdir(STAGING_WORKDIR, { recursive: true });
-          
-          // Export exact commit tree to staging via git archive
-          console.log(`[push-to-staging] exporting commit ${commitSha} to ${STAGING_WORKDIR}`);
-          await exportGitCommit(commitSha, STAGING_WORKDIR);
-        } else {
-          // No version specified; copy from current working tree
-          console.log(`[push-to-staging] copying from working tree (no version specified)`);
-          await fs.promises.cp(SOURCE_ROOT, STAGING_WORKDIR, {
-            recursive: true,
-            force: true,
-            filter: (src) => !PUSH_EXCLUDE.has(path.basename(src)),
-          });
-          await syncDelete(SOURCE_ROOT, STAGING_WORKDIR);
-        }
+        const sourceBranch = 'staging';
+        console.log(`[push-to-staging] resolving branch ${sourceBranch}`);
+        const commitSha = await resolveGitRef(sourceBranch);
+        console.log(`[push-to-staging] branch ${sourceBranch} → ${commitSha}`);
+
+          await clearDirectoryContents(STAGING_WORKDIR);
+
+        console.log(`[push-to-staging] exporting commit ${commitSha} to ${STAGING_WORKDIR}`);
+        await exportGitCommit(commitSha, STAGING_WORKDIR);
 
         // Patch package.json to use local webcomponents (not GitHub)
         const stagingPkgPath = path.join(STAGING_WORKDIR, 'package.json');
@@ -284,8 +344,8 @@ const DEV_OPS = {
 
         // Clear Vite cache for clean rebuild
         await fs.promises.rm(path.join(STAGING_WORKDIR, 'node_modules', '.vite'), { recursive: true, force: true });
-        
-        return version ? `Code pushed to staging from approved tag staging-v${version}.` : 'Code pushed to staging from working tree.';
+
+        return `Code pushed to staging from branch ${sourceBranch} at ${commitSha}.`;
       } finally {
         try { fs.unlinkSync(sentinelPath); } catch { }
       }
@@ -432,7 +492,7 @@ async function buildJob(target, scope) {
     throw new Error(message);
   }
 
-  const archivePath = path.join(ARCHIVE_DIR, createdArchive);
+  const archivePath = path.join(STATIC_ARCHIVE_DIR, createdArchive);
   console.log(`[worker] ${target} found archive: ${path.basename(archivePath)}`);
   cleanupOldArchives(target, MAX_BACKUPS);
   updateStatus('backup', target, { archivePath });
@@ -474,12 +534,15 @@ function enqueueTarget(target, source = 'manual', scope = 'full') {
 }
 
 const server = http.createServer(async (req, res) => {
+  const requestUrl = new URL(req.url || '/', 'http://127.0.0.1');
+  const pathname = requestUrl.pathname;
+
   const respond = (code, data) => {
     res.writeHead(code, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(data));
   };
 
-  if (req.method === 'GET' && req.url === '/health') {
+  if (req.method === 'GET' && pathname === '/health') {
     return respond(200, { status: 'ok' });
   }
 
@@ -487,11 +550,11 @@ const server = http.createServer(async (req, res) => {
     return respond(401, { error: 'unauthorized' });
   }
 
-  if (req.method === 'GET' && req.url === '/status') {
+  if (req.method === 'GET' && pathname === '/status') {
     return respond(200, getRuntimeState());
   }
 
-  if (req.method === 'POST' && req.url === '/trigger') {
+  if (req.method === 'POST' && pathname === '/trigger') {
     let body = {};
     try {
       body = await readJsonBody(req);
@@ -522,7 +585,7 @@ const server = http.createServer(async (req, res) => {
     return respond(202, { status: 'queued', target, source, scope });
   }
 
-  if (req.method === 'POST' && req.url === '/restore') {
+  if (req.method === 'POST' && pathname === '/restore') {
     let body = {};
     try {
       body = await readJsonBody(req);
@@ -555,11 +618,74 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  if (req.method === 'GET' && req.url === '/dev-tools/status') {
+  if (req.method === 'GET' && pathname === '/dev-tools/status') {
     return respond(200, devToolsState);
   }
 
-  if (req.method === 'POST' && DEV_OPS[req.url]) {
+  if (req.method === 'GET' && pathname === '/dev-tools/media-backups') {
+    const target = String(requestUrl.searchParams.get('target') || '').trim();
+    if (!['dev', 'staging'].includes(target)) {
+      return respond(400, { error: 'invalid target', valid: ['dev', 'staging'] });
+    }
+
+    return respond(200, {
+      target,
+      backups: listMediaBackups(target),
+    });
+  }
+
+  if (req.method === 'GET' && pathname === '/dev-tools/media-backups/download') {
+    const target = String(requestUrl.searchParams.get('target') || '').trim();
+    const file = String(requestUrl.searchParams.get('file') || '').trim();
+    if (!['dev', 'staging'].includes(target)) {
+      return respond(400, { error: 'invalid target', valid: ['dev', 'staging'] });
+    }
+
+    try {
+      const archivePath = resolveMediaBackupArchive(target, file);
+      const stat = fs.statSync(archivePath);
+      res.writeHead(200, {
+        'Content-Type': 'application/zip',
+        'Content-Disposition': `attachment; filename="${path.basename(archivePath)}"`,
+        'Content-Length': String(stat.size),
+      });
+      fs.createReadStream(archivePath).pipe(res);
+      return;
+    } catch (error) {
+      return respond(404, {
+        error: 'archive not found',
+        message: error instanceof Error ? error.message : 'unknown error',
+      });
+    }
+  }
+
+  if (req.method === 'POST' && pathname === '/dev-tools/media-backups/delete') {
+    let body = {};
+    try {
+      body = await readJsonBody(req);
+    } catch {
+      return respond(400, { error: 'invalid json' });
+    }
+
+    const target = String(body.target || '').trim();
+    const file = String(body.file || '').trim();
+    if (!['dev', 'staging'].includes(target)) {
+      return respond(400, { error: 'invalid target', valid: ['dev', 'staging'] });
+    }
+
+    try {
+      const archivePath = resolveMediaBackupArchive(target, file);
+      fs.unlinkSync(archivePath);
+      return respond(200, { status: 'deleted', target, file });
+    } catch (error) {
+      return respond(404, {
+        error: 'delete failed',
+        message: error instanceof Error ? error.message : 'unknown error',
+      });
+    }
+  }
+
+  if (req.method === 'POST' && DEV_OPS[pathname]) {
     let body = {};
     try {
       body = await readJsonBody(req);
@@ -569,7 +695,7 @@ const server = http.createServer(async (req, res) => {
     }
     
     // DEV_OPS entries can be operation objects or factory functions
-    const opDefOrFactory = DEV_OPS[req.url];
+    const opDefOrFactory = DEV_OPS[pathname];
     const op = typeof opDefOrFactory === 'function' ? opDefOrFactory(body) : opDefOrFactory;
     
     if (op.requiresStaging && !STAGING_WORKDIR) {
