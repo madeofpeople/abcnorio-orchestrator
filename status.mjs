@@ -142,7 +142,7 @@ export function markFailed(target, message) {
   });
 }
 
-export function recordBackup(status, target, archivePath) {
+function recordBackup(status, target, archivePath, sourceCommitSha = null) {
   const resolvedPath = path.resolve(archivePath);
   if (!fs.existsSync(resolvedPath)) {
     throw new Error(`backup path does not exist: ${resolvedPath}`);
@@ -157,6 +157,7 @@ export function recordBackup(status, target, archivePath) {
     createdAt: new Date(stats.mtimeMs).toISOString(),
     mtime: Math.floor(stats.mtimeMs / 1000),
     size: stats.size,
+    sourceCommitSha,
   };
 
   envStatus.backups = [backup, ...envStatus.backups.filter((entry) => entry?.name !== name)]
@@ -194,7 +195,7 @@ export function updateStatus(action, target, payload) {
   const status = loadStatus();
 
   if (action === 'backup') {
-    recordBackup(status, target, payload.archivePath);
+    recordBackup(status, target, payload.archivePath, payload.sourceCommitSha || null);
   } else if (action === 'deploy') {
     recordDeploy(status, target, payload.deployBuildPath);
   } else if (action === 'smoke') {

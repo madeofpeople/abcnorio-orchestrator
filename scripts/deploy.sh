@@ -91,6 +91,8 @@ if [ -n "${BUILD_PATH}" ] && [ -d "${BUILD_PATH}" ]; then
     export BUILD_CACHE_TTL_MS
     export BACKUP_TARGET="${TARGET}"
     export BACKUP_SOURCE_DIR="${BUILD_PATH}"
+    export BACKUP_COMMIT_SHA="${SOURCE_COMMIT_SHA:-unknown}"
+    export BACKUP_COMMIT_SHORT_SHA="${BACKUP_COMMIT_SHA:0:7}"
     export ASTRO_BUILD_BACKUP=1
     bash "${ORCHESTRATOR_SCRIPT_ROOT:-/orchestrator/scripts}/backup-build.sh"
     npm run build

@@ -3,8 +3,9 @@ set -e
 
 BACKUP_SOURCE_DIR="${BACKUP_SOURCE_DIR:-${PRODUCTION_BUILD_PATH:-../../web/static/prod}}"
 BACKUP_TARGET="${BACKUP_TARGET:-production}"
+BACKUP_COMMIT_SHORT_SHA="${BACKUP_COMMIT_SHORT_SHA:-unknown}"
 ARCHIVE_DIR="${ASTRO_BUILD_STATIC_ARCHIVE_DIR:-./build-archives/static-backup}"
-ARCHIVE_PATH="${ARCHIVE_DIR}/abcnorio-astro-${BACKUP_TARGET}-$(date +%Y%m%d-%H%M%S).zip"
+ARCHIVE_PATH="${ARCHIVE_DIR}/abcnorio-astro-${BACKUP_TARGET}-$(date +%Y%m%d-%H%M%S)-${BACKUP_COMMIT_SHORT_SHA}.zip"
 
 mkdir -p "$ARCHIVE_DIR"
 

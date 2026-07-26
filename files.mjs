@@ -47,11 +47,11 @@ export function resolveArchiveForTarget(target, requestedName) {
   return archivePath;
 }
 
-export function runCommand(command, args) {
+export function runCommand(command, args, env = process.env) {
   return new Promise((resolve) => {
     const proc = spawn(command, args, {
       cwd: WORKDIR,
-      env: process.env,
+      env,
       stdio: 'inherit',
     });
 

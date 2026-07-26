@@ -22,12 +22,17 @@ const PORT = Number(process.env.ORCHESTRATOR_PORT || 4011);
 const SECRET = process.env.ASTRO_BUILD_TRIGGER_SECRET || '';
 const ALLOW_MANUAL_TRIGGER = process.env.ORCHESTRATOR_ALLOW_MANUAL_TRIGGER !== '0';
 const MAX_BACKUPS = Number(process.env.MAX_BACKUPS || 12);
+const STAGING_SUCCESS_RELEASES_TO_KEEP = Number(process.env.STAGING_SUCCESS_RELEASES_TO_KEEP || 2);
+const STAGING_FAILED_RELEASES_TO_KEEP = Number(process.env.STAGING_FAILED_RELEASES_TO_KEEP || 1);
 
 const SOURCE_ROOT = process.env.ASTRO_SITE_ROOT || '/astro-site';
 const SOURCE_GIT_ROOT = process.env.ASTRO_SITE_GIT_ROOT || SOURCE_ROOT;
 const SOURCE_GIT_SUBDIR = (process.env.ASTRO_SITE_GIT_SUBDIR || '').replace(/^\/+|\/+$/g, '');
 const WORKDIR = process.env.ASTRO_BUILD_WORKDIR || SOURCE_ROOT;
 const STAGING_WORKDIR = process.env.ASTRO_STAGING_SITE_ROOT || '';
+const STAGING_RELEASES_ROOT = process.env.ASTRO_STAGING_RELEASES_ROOT
+  ? path.resolve(process.env.ASTRO_STAGING_RELEASES_ROOT)
+  : path.join(STAGING_WORKDIR, 'releases');
 const SCRIPT_ROOT = process.env.ORCHESTRATOR_SCRIPT_ROOT || '/orchestrator/scripts';
 const BASE_ARCHIVE_DIR = process.env.ASTRO_BUILD_ARCHIVE_DIR
   ? path.resolve(process.env.ASTRO_BUILD_ARCHIVE_DIR)
@@ -38,6 +43,7 @@ const STATIC_ARCHIVE_DIR = process.env.ASTRO_BUILD_STATIC_ARCHIVE_DIR
 const MEDIA_ARCHIVE_DIR = process.env.ASTRO_BUILD_MEDIA_ARCHIVE_DIR
   ? path.resolve(process.env.ASTRO_BUILD_MEDIA_ARCHIVE_DIR)
   : path.resolve(BASE_ARCHIVE_DIR, 'media');
+const STAGING_LAST_FAILED_FILE = '.last-failed-release';
 
 function listMediaBackups(target) {
   if (!fs.existsSync(MEDIA_ARCHIVE_DIR)) {
@@ -166,6 +172,66 @@ async function clearDirectoryContents(dir) {
   await Promise.all(entries.map((entry) => fs.promises.rm(path.join(dir, entry), { recursive: true, force: true })));
 }
 
+async function clearDirectoryContentsExcept(dir, keepEntries = []) {
+  const keep = new Set(keepEntries);
+  await fs.promises.mkdir(dir, { recursive: true });
+  const entries = await fs.promises.readdir(dir);
+  await Promise.all(entries
+    .filter((entry) => !keep.has(entry))
+    .map((entry) => fs.promises.rm(path.join(dir, entry), { recursive: true, force: true })));
+}
+
+async function copyDirectoryContents(srcDir, destDir) {
+  await fs.promises.mkdir(destDir, { recursive: true });
+  const entries = await fs.promises.readdir(srcDir, { withFileTypes: true });
+  await Promise.all(entries.map((entry) => {
+    const srcPath = path.join(srcDir, entry.name);
+    const destPath = path.join(destDir, entry.name);
+    return fs.promises.cp(srcPath, destPath, { recursive: true, force: true });
+  }));
+}
+
+async function pruneStagingReleaseDirs(releasesRoot, successfulTag) {
+  await fs.promises.mkdir(releasesRoot, { recursive: true });
+  const entries = await fs.promises.readdir(releasesRoot, { withFileTypes: true });
+  const dirs = entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name);
+
+  const lastFailedPath = path.join(releasesRoot, STAGING_LAST_FAILED_FILE);
+  let failedTag = '';
+  if (fs.existsSync(lastFailedPath)) {
+    failedTag = (await fs.promises.readFile(lastFailedPath, 'utf8')).trim();
+  }
+
+  const stagingDeployTags = dirs.filter((name) => name.startsWith('staging-deploy-'));
+  const successful = [];
+  for (const tag of stagingDeployTags) {
+    if (failedTag && tag === failedTag) {
+      continue;
+    }
+    const fullPath = path.join(releasesRoot, tag);
+    const stat = await fs.promises.stat(fullPath);
+    successful.push({ tag, mtime: stat.mtimeMs });
+  }
+
+  successful.sort((a, b) => b.mtime - a.mtime);
+  const keepSuccessful = new Set(successful.slice(0, STAGING_SUCCESS_RELEASES_TO_KEEP).map((item) => item.tag));
+  if (successfulTag) {
+    keepSuccessful.add(successfulTag);
+  }
+
+  const failedToKeep = new Set();
+  if (failedTag && STAGING_FAILED_RELEASES_TO_KEEP > 0) {
+    failedToKeep.add(failedTag);
+  }
+
+  for (const tag of stagingDeployTags) {
+    if (keepSuccessful.has(tag) || failedToKeep.has(tag)) {
+      continue;
+    }
+    await fs.promises.rm(path.join(releasesRoot, tag), { recursive: true, force: true });
+  }
+}
+
 // Resolve git ref (branch, tag, or commit-ish) to commit SHA in SOURCE_GIT_ROOT.
 async function resolveGitRef(ref) {
   return new Promise((resolve, reject) => {
@@ -183,6 +249,46 @@ async function resolveGitRef(ref) {
       } else {
         reject(new Error(`Failed to resolve git ref ${ref}: ${stderr.trim()}`));
       }
+    });
+    proc.on('error', (err) => {
+      reject(new Error(`git process error: ${err.message}`));
+    });
+  });
+}
+
+async function resolveLatestTagByPrefix(prefix) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn('git', [
+      'for-each-ref',
+      '--sort=-creatordate',
+      '--format=%(refname:strip=2)',
+      `refs/tags/${prefix}*`,
+    ], {
+      cwd: SOURCE_GIT_ROOT,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    let stdout = '';
+    let stderr = '';
+    proc.stdout.on('data', (d) => { stdout += d.toString(); });
+    proc.stderr.on('data', (d) => { stderr += d.toString(); });
+    proc.on('close', (code) => {
+      if (code !== 0) {
+        reject(new Error(`Failed to list tags for prefix ${prefix}: ${stderr.trim()}`));
+        return;
+      }
+
+      const tags = stdout
+        .split('\n')
+        .map((line) => line.trim())
+        .filter(Boolean);
+
+      if (tags.length === 0) {
+        reject(new Error(`No tags found for prefix ${prefix}`));
+        return;
+      }
+
+      resolve(tags[0]);
     });
     proc.on('error', (err) => {
       reject(new Error(`git process error: ${err.message}`));
@@ -240,6 +346,62 @@ async function runGitCommand(args) {
       reject(new Error(`git process error: ${err.message}`));
     });
   });
+}
+
+async function gitIsAncestor(ancestorRef, descendantRef) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn('git', ['merge-base', '--is-ancestor', ancestorRef, descendantRef], {
+      cwd: SOURCE_GIT_ROOT,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stderr = '';
+    proc.stderr.on('data', (d) => { stderr += d.toString(); });
+    proc.on('close', (code) => {
+      if (code === 0) {
+        resolve(true);
+        return;
+      }
+
+      if (code === 1) {
+        resolve(false);
+        return;
+      }
+
+      reject(new Error(`Failed ancestry check ${ancestorRef} -> ${descendantRef}: ${stderr.trim()}`));
+    });
+    proc.on('error', (err) => {
+      reject(new Error(`git process error: ${err.message}`));
+    });
+  });
+}
+
+async function fastForwardBranch(branchName, commitSha) {
+  const existingBranchSha = await resolveGitRefIfExists(branchName);
+  if (existingBranchSha) {
+    const isAncestor = await gitIsAncestor(existingBranchSha, commitSha);
+    if (!isAncestor) {
+      throw new Error(`refusing non-fast-forward update for ${branchName}: ${existingBranchSha} is not ancestor of ${commitSha}`);
+    }
+  }
+
+  const updateArgs = ['update-ref', `refs/heads/${branchName}`, commitSha];
+  if (existingBranchSha) {
+    updateArgs.push(existingBranchSha);
+  }
+  await runGitCommand(updateArgs);
+  await runGitCommand(['push', 'origin', `refs/heads/${branchName}:refs/heads/${branchName}`]);
+}
+
+async function assertFastForwardPossible(branchName, commitSha) {
+  const existingBranchSha = await resolveGitRefIfExists(branchName);
+  if (!existingBranchSha) {
+    return;
+  }
+
+  const isAncestor = await gitIsAncestor(existingBranchSha, commitSha);
+  if (!isAncestor) {
+    throw new Error(`refusing non-fast-forward update for ${branchName}: ${existingBranchSha} is not ancestor of ${commitSha}`);
+  }
 }
 
 async function tagProductionDeploy(commitSha, deployedAt) {
@@ -332,6 +494,34 @@ async function npmInstall(dir) {
   });
 }
 
+async function npmInstallDeterministic(dir) {
+  const hasLock = fs.existsSync(path.join(dir, 'package-lock.json'));
+  if (hasLock) {
+    return new Promise((resolve, reject) => {
+      const proc = spawn('npm', ['ci'], {
+        cwd: dir,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let stderr = '';
+      let stdout = '';
+      proc.stdout.on('data', (d) => { stdout += d.toString(); });
+      proc.stderr.on('data', (d) => { stderr += d.toString(); });
+      proc.on('close', (code) => {
+        if (code === 0) {
+          resolve();
+        } else {
+          reject(new Error(`npm ci failed: ${stderr.trim() || stdout.trim() || 'unknown error'}`));
+        }
+      });
+      proc.on('error', (err) => {
+        reject(new Error(`npm process error: ${err.message}`));
+      });
+    });
+  }
+
+  return npmInstall(dir);
+}
+
 const DEV_OPS = {
   '/dev-tools/copy-media-to-staging': {
     key: 'copyMediaToStagingFromDev',
@@ -373,27 +563,34 @@ const DEV_OPS = {
       return 'Staging data pulled to dev.';
     },
   },
-  '/dev-tools/push-to-staging': () => ({
+  '/dev-tools/push-to-staging': (requestBody = {}) => ({
     key: 'push',
     label: 'push-to-staging',
     requiresStaging: true,
     run: async () => {
       const sentinelPath = path.join(STAGING_WORKDIR, '.push-in-progress');
+      const stagingTagPrefix = 'staging-deploy-';
+      let sourceTag = '';
       
       try { fs.writeFileSync(sentinelPath, ''); } catch { }
       try {
-        const sourceBranch = 'staging';
-        console.log(`[push-to-staging] resolving branch ${sourceBranch}`);
-        const commitSha = await resolveGitRef(sourceBranch);
-        console.log(`[push-to-staging] branch ${sourceBranch} → ${commitSha}`);
+        sourceTag = String(requestBody.tag || '').trim();
+        if (sourceTag) {
+          console.log(`[push-to-staging] using requested tag ${sourceTag}`);
+        } else {
+          console.log(`[push-to-staging] resolving latest tag ${stagingTagPrefix}*`);
+          sourceTag = await resolveLatestTagByPrefix(stagingTagPrefix);
+        }
+        const commitSha = await resolveGitRef(sourceTag);
+        console.log(`[push-to-staging] selected tag ${sourceTag} → ${commitSha}`);
 
-          await clearDirectoryContents(STAGING_WORKDIR);
-
-        console.log(`[push-to-staging] exporting commit ${commitSha} to ${STAGING_WORKDIR}`);
-        await exportGitCommit(commitSha, STAGING_WORKDIR);
+        const releaseDir = path.join(STAGING_RELEASES_ROOT, sourceTag);
+        await clearDirectoryContents(releaseDir);
+        console.log(`[push-to-staging] exporting commit ${commitSha} to release ${releaseDir}`);
+        await exportGitCommit(commitSha, releaseDir);
 
         // Patch package.json to use local webcomponents (not GitHub)
-        const stagingPkgPath = path.join(STAGING_WORKDIR, 'package.json');
+        const stagingPkgPath = path.join(releaseDir, 'package.json');
         const stagingPkg = JSON.parse(await fs.promises.readFile(stagingPkgPath, 'utf8'));
         const webcompDep = stagingPkg.dependencies?.['abcnorio-webcomponents'];
         
@@ -403,20 +600,38 @@ const DEV_OPS = {
           console.log(`[push-to-staging] patched webcomponents to local file: path`);
         }
 
-        // Clean node_modules and lock file to ensure fresh install
-        console.log(`[push-to-staging] cleaning node_modules and lockfile`);
-        await fs.promises.rm(path.join(STAGING_WORKDIR, 'node_modules'), { recursive: true, force: true });
+        // Cut over active staging tree from prepared release.
+        await clearDirectoryContentsExcept(STAGING_WORKDIR, ['releases', '.push-in-progress']);
+        await copyDirectoryContents(releaseDir, STAGING_WORKDIR);
+
+        // Runtime installs happen in /app; pin local webcomponents to container absolute path.
+        const activePkgPath = path.join(STAGING_WORKDIR, 'package.json');
+        const activePkg = JSON.parse(await fs.promises.readFile(activePkgPath, 'utf8'));
+        const activeWebcompDep = activePkg.dependencies?.['abcnorio-webcomponents'];
+        if (activeWebcompDep && (activeWebcompDep.startsWith('file:') || activeWebcompDep.startsWith('github:'))) {
+          activePkg.dependencies['abcnorio-webcomponents'] = 'file:/abcnorio-webcomponents';
+          await fs.promises.writeFile(activePkgPath, JSON.stringify(activePkg, null, 2) + '\n', 'utf8');
+        }
+
+        // Force runtime reinstall/lock refresh in /app context so local file deps resolve correctly.
         await fs.promises.rm(path.join(STAGING_WORKDIR, 'package-lock.json'), { force: true });
 
-        // Install dependencies
-        console.log(`[push-to-staging] running npm install`);
-        await npmInstall(STAGING_WORKDIR);
-        console.log(`[push-to-staging] npm install completed`);
+        await fs.promises.rm(path.join(STAGING_WORKDIR, 'node_modules'), { recursive: true, force: true });
 
-        // Clear Vite cache for clean rebuild
-        await fs.promises.rm(path.join(STAGING_WORKDIR, 'node_modules', '.vite'), { recursive: true, force: true });
+        await pruneStagingReleaseDirs(STAGING_RELEASES_ROOT, sourceTag);
+        await fs.promises.rm(path.join(STAGING_RELEASES_ROOT, STAGING_LAST_FAILED_FILE), { force: true });
 
-        return `Code pushed to staging from branch ${sourceBranch} at ${commitSha}.`;
+        return `Code pushed to staging from tag ${sourceTag} at ${commitSha}.`;
+      } catch (error) {
+        try {
+          if (sourceTag) {
+            await fs.promises.mkdir(STAGING_RELEASES_ROOT, { recursive: true });
+            await fs.promises.writeFile(path.join(STAGING_RELEASES_ROOT, STAGING_LAST_FAILED_FILE), `${sourceTag}\n`, 'utf8');
+          }
+        } catch {
+          // ignore failure marker write errors; do not mask root failure
+        }
+        throw error;
       } finally {
         try { fs.unlinkSync(sentinelPath); } catch { }
       }
@@ -538,7 +753,10 @@ async function buildJob(target, scope) {
 
   console.log(`[worker] ${target} executing ${DEPLOY_SCRIPT}`);
   const archiveBefore = new Set(listArchivesForTarget(target));
-  const exitCode = await runCommand('bash', [DEPLOY_SCRIPT, target, scope]);
+  const exitCode = await runCommand('bash', [DEPLOY_SCRIPT, target, scope], {
+    ...process.env,
+    SOURCE_COMMIT_SHA: sourceCommitSha,
+  });
   console.log(`[worker] ${target} script exited with code ${exitCode}`);
 
   if (exitCode !== 0) {
@@ -567,7 +785,7 @@ async function buildJob(target, scope) {
   const archivePath = path.join(STATIC_ARCHIVE_DIR, createdArchive);
   console.log(`[worker] ${target} found archive: ${path.basename(archivePath)}`);
   cleanupOldArchives(target, MAX_BACKUPS);
-  updateStatus('backup', target, { archivePath });
+  updateStatus('backup', target, { archivePath, sourceCommitSha });
   updateStatus('deploy', target, { deployBuildPath: resolvedDeployPath });
 
   const smokeResults = await runSmokeChecks(target, resolvedDeployPath);
