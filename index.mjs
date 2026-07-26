@@ -190,6 +190,77 @@ async function resolveGitRef(ref) {
   });
 }
 
+async function resolveGitRefIfExists(ref) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn('git', ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], {
+      cwd: SOURCE_GIT_ROOT,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    let stdout = '';
+    let stderr = '';
+    proc.stdout.on('data', (d) => { stdout += d.toString(); });
+    proc.stderr.on('data', (d) => { stderr += d.toString(); });
+    proc.on('close', (code) => {
+      if (code === 0) {
+        resolve(stdout.trim());
+        return;
+      }
+
+      if (!stdout.trim() && !stderr.trim()) {
+        resolve(null);
+        return;
+      }
+
+      reject(new Error(`Failed to resolve git ref ${ref}: ${stderr.trim()}`));
+    });
+    proc.on('error', (err) => {
+      reject(new Error(`git process error: ${err.message}`));
+    });
+  });
+}
+
+async function runGitCommand(args) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn('git', args, {
+      cwd: SOURCE_GIT_ROOT,
+      stdio: 'inherit',
+    });
+
+    proc.on('close', (code) => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+
+      reject(new Error(`git ${args.join(' ')} failed with exit code ${code ?? 1}`));
+    });
+
+    proc.on('error', (err) => {
+      reject(new Error(`git process error: ${err.message}`));
+    });
+  });
+}
+
+async function tagProductionDeploy(commitSha, deployedAt) {
+  const deployDate = new Date(deployedAt).toISOString().slice(0, 10);
+  const shortSha = commitSha.slice(0, 7);
+  const tagName = `production-deploy-${deployDate}-${shortSha}`;
+
+  const existingCommitSha = await resolveGitRefIfExists(tagName);
+  if (existingCommitSha && existingCommitSha !== commitSha) {
+    throw new Error(`production tag ${tagName} already points to ${existingCommitSha}, expected ${commitSha}`);
+  }
+
+  if (!existingCommitSha) {
+    await runGitCommand(['tag', '-a', tagName, commitSha, '-m', `Production deploy ${deployDate} ${shortSha}`]);
+  }
+
+  await runGitCommand(['push', 'origin', tagName]);
+
+  return tagName;
+}
+
 // Export specific git commit tree to target directory via git archive
 async function exportGitCommit(commitSha, targetDir) {
   return new Promise((resolve, reject) => {
@@ -450,6 +521,7 @@ async function buildJob(target, scope) {
 
   const deployBuildPath = TARGETS[target];
   const resolvedDeployPath = assertDeployPath(target, deployBuildPath);
+  const sourceCommitSha = await resolveGitRef('HEAD');
 
   const startedAt = Date.now();
   setRuntimeState({
@@ -520,6 +592,12 @@ async function buildJob(target, scope) {
     message: null,
   });
   markDone(target);
+
+  if (target === 'production') {
+    const tagName = await tagProductionDeploy(sourceCommitSha, Date.now());
+    console.log(`[worker] production deploy tagged: ${tagName} @ ${sourceCommitSha}`);
+  }
+
   console.log(`[worker] ${target} deployment completed successfully`);
 }
 
