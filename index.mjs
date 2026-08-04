@@ -589,27 +589,27 @@ const DEV_OPS = {
         console.log(`[push-to-staging] exporting commit ${commitSha} to release ${releaseDir}`);
         await exportGitCommit(commitSha, releaseDir);
 
-        // Patch package.json to use local webcomponents (not GitHub)
+        // Patch package.json to use the staging branch from GitHub.
         const stagingPkgPath = path.join(releaseDir, 'package.json');
         const stagingPkg = JSON.parse(await fs.promises.readFile(stagingPkgPath, 'utf8'));
         const webcompDep = stagingPkg.dependencies?.['abcnorio-webcomponents'];
         
         if (webcompDep && (webcompDep.startsWith('file:') || webcompDep.startsWith('github:'))) {
-          stagingPkg.dependencies['abcnorio-webcomponents'] = 'file:../../abcnorio-webcomponents';
+          stagingPkg.dependencies['abcnorio-webcomponents'] = 'github:madeofpeople/abcnorio-webcomponents#staging';
           await fs.promises.writeFile(stagingPkgPath, JSON.stringify(stagingPkg, null, 2) + '\n', 'utf8');
-          console.log(`[push-to-staging] patched webcomponents to local file: path`);
+          console.log(`[push-to-staging] patched webcomponents to github:madeofpeople/abcnorio-webcomponents#staging`);
         }
 
         // Cut over active staging tree from prepared release.
         await clearDirectoryContentsExcept(STAGING_WORKDIR, ['releases', '.push-in-progress']);
         await copyDirectoryContents(releaseDir, STAGING_WORKDIR);
 
-        // Runtime installs happen in /app; pin local webcomponents to container absolute path.
+        // Keep active staging tree pinned to GitHub staging branch as well.
         const activePkgPath = path.join(STAGING_WORKDIR, 'package.json');
         const activePkg = JSON.parse(await fs.promises.readFile(activePkgPath, 'utf8'));
         const activeWebcompDep = activePkg.dependencies?.['abcnorio-webcomponents'];
         if (activeWebcompDep && (activeWebcompDep.startsWith('file:') || activeWebcompDep.startsWith('github:'))) {
-          activePkg.dependencies['abcnorio-webcomponents'] = 'file:/abcnorio-webcomponents';
+          activePkg.dependencies['abcnorio-webcomponents'] = 'github:madeofpeople/abcnorio-webcomponents#staging';
           await fs.promises.writeFile(activePkgPath, JSON.stringify(activePkg, null, 2) + '\n', 'utf8');
         }
 
