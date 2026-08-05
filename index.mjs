@@ -522,6 +522,54 @@ async function npmInstallDeterministic(dir) {
   return npmInstall(dir);
 }
 
+async function assertReadablePath(targetPath, label) {
+  let stat;
+  try {
+    stat = await fs.promises.stat(targetPath);
+  } catch {
+    throw new Error(`${label} missing at ${targetPath}`);
+  }
+
+  if (!stat.isFile()) {
+    throw new Error(`${label} is not a file at ${targetPath}`);
+  }
+}
+
+async function assertStagingTreeContract(stagingRoot) {
+  const requiredFiles = [
+    ['package.json', 'staging package'],
+    ['astro.config.mjs', 'staging astro config'],
+    ['src/pages/index.astro', 'staging index route'],
+  ];
+
+  await Promise.all(requiredFiles.map(([relativePath, label]) =>
+    assertReadablePath(path.join(stagingRoot, relativePath), label)
+  ));
+}
+
+async function assertNodeModuleResolvable(stagingRoot, moduleName) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn('node', ['-e', `require.resolve(${JSON.stringify(moduleName)});`], {
+      cwd: stagingRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    let stderr = '';
+    proc.stderr.on('data', (d) => { stderr += d.toString(); });
+    proc.on('close', (code) => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+
+      reject(new Error(`runtime dependency missing (${moduleName}): ${stderr.trim() || 'resolution failed'}`));
+    });
+    proc.on('error', (err) => {
+      reject(new Error(`node process error (${moduleName}): ${err.message}`));
+    });
+  });
+}
+
 const DEV_OPS = {
   '/dev-tools/copy-media-to-staging': {
     key: 'copyMediaToStagingFromDev',
@@ -613,10 +661,15 @@ const DEV_OPS = {
           await fs.promises.writeFile(activePkgPath, JSON.stringify(activePkg, null, 2) + '\n', 'utf8');
         }
 
+        await assertStagingTreeContract(STAGING_WORKDIR);
+
         // Force runtime reinstall/lock refresh in /app context so local file deps resolve correctly.
         await fs.promises.rm(path.join(STAGING_WORKDIR, 'package-lock.json'), { force: true });
 
         await fs.promises.rm(path.join(STAGING_WORKDIR, 'node_modules'), { recursive: true, force: true });
+        await npmInstallDeterministic(STAGING_WORKDIR);
+        await assertNodeModuleResolvable(STAGING_WORKDIR, 'astro');
+        await assertNodeModuleResolvable(STAGING_WORKDIR, 'shiki');
 
         await pruneStagingReleaseDirs(STAGING_RELEASES_ROOT, sourceTag);
         await fs.promises.rm(path.join(STAGING_RELEASES_ROOT, STAGING_LAST_FAILED_FILE), { force: true });
