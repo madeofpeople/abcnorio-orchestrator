@@ -326,6 +326,26 @@ async function resolveGitRefIfExists(ref) {
   });
 }
 
+function npmSpawnEnv() {
+  const env = { ...process.env };
+
+  // Keep npm memory bounded inside constrained containers to reduce OOM kills.
+  // Keep the cap modest enough for the orchestrator container while leaving room for
+  // the package graph resolution itself to complete.
+  if (!env.NODE_OPTIONS || !env.NODE_OPTIONS.includes('--max-old-space-size=')) {
+    env.NODE_OPTIONS = `${env.NODE_OPTIONS ? `${env.NODE_OPTIONS} ` : ''}--max-old-space-size=256`;
+  }
+
+  env.npm_config_audit = env.npm_config_audit || 'false';
+  env.npm_config_fund = env.npm_config_fund || 'false';
+  env.npm_config_progress = env.npm_config_progress || 'false';
+  env.npm_config_loglevel = env.npm_config_loglevel || 'warn';
+  env.npm_config_jobs = env.npm_config_jobs || '1';
+  env.npm_config_cache = env.npm_config_cache || '/tmp/npm-cache';
+
+  return env;
+}
+
 async function runGitCommand(args) {
   return new Promise((resolve, reject) => {
     const proc = spawn('git', args, {
@@ -475,17 +495,60 @@ async function npmInstall(dir) {
   return new Promise((resolve, reject) => {
     const proc = spawn('npm', ['install', '--package-lock=false'], {
       cwd: dir,
+      env: npmSpawnEnv(),
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let stderr = '';
     let stdout = '';
+    let exitCode = null;
+    let exitSignal = null;
     proc.stdout.on('data', (d) => { stdout += d.toString(); });
     proc.stderr.on('data', (d) => { stderr += d.toString(); });
-    proc.on('close', (code) => {
-      if (code === 0) {
+    proc.on('exit', (code, signal) => {
+      exitCode = code;
+      exitSignal = signal;
+    });
+    proc.on('close', () => {
+      if (exitCode === 0) {
         resolve();
       } else {
-        reject(new Error(`npm install failed: ${stderr.trim() || stdout.trim() || 'unknown error'}`));
+        const stderrTail = stderr.trim().split('\n').slice(-30).join('\n');
+        const stdoutTail = stdout.trim().split('\n').slice(-30).join('\n');
+        const reason = stderrTail || stdoutTail || 'no npm output captured';
+        reject(new Error(`npm install failed (code=${String(exitCode)}, signal=${String(exitSignal)}): ${reason}`));
+      }
+    });
+    proc.on('error', (err) => {
+      reject(new Error(`npm process error: ${err.message}`));
+    });
+  });
+}
+
+async function npmCi(dir) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn('npm', ['ci'], {
+      cwd: dir,
+      env: npmSpawnEnv(),
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stderr = '';
+    let stdout = '';
+    let exitCode = null;
+    let exitSignal = null;
+    proc.stdout.on('data', (d) => { stdout += d.toString(); });
+    proc.stderr.on('data', (d) => { stderr += d.toString(); });
+    proc.on('exit', (code, signal) => {
+      exitCode = code;
+      exitSignal = signal;
+    });
+    proc.on('close', () => {
+      if (exitCode === 0) {
+        resolve();
+      } else {
+        const stderrTail = stderr.trim().split('\n').slice(-30).join('\n');
+        const stdoutTail = stdout.trim().split('\n').slice(-30).join('\n');
+        const reason = stderrTail || stdoutTail || 'no npm output captured';
+        reject(new Error(`npm ci failed (code=${String(exitCode)}, signal=${String(exitSignal)}): ${reason}`));
       }
     });
     proc.on('error', (err) => {
@@ -497,26 +560,16 @@ async function npmInstall(dir) {
 async function npmInstallDeterministic(dir) {
   const hasLock = fs.existsSync(path.join(dir, 'package-lock.json'));
   if (hasLock) {
-    return new Promise((resolve, reject) => {
-      const proc = spawn('npm', ['ci'], {
-        cwd: dir,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-      let stderr = '';
-      let stdout = '';
-      proc.stdout.on('data', (d) => { stdout += d.toString(); });
-      proc.stderr.on('data', (d) => { stderr += d.toString(); });
-      proc.on('close', (code) => {
-        if (code === 0) {
-          resolve();
-        } else {
-          reject(new Error(`npm ci failed: ${stderr.trim() || stdout.trim() || 'unknown error'}`));
-        }
-      });
-      proc.on('error', (err) => {
-        reject(new Error(`npm process error: ${err.message}`));
-      });
-    });
+    try {
+      await npmCi(dir);
+      return;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`[npm-install] npm ci failed in ${dir}; falling back to npm install --package-lock=false`);
+      console.warn(`[npm-install] ci error: ${message}`);
+      await npmInstall(dir);
+      return;
+    }
   }
 
   return npmInstall(dir);
@@ -638,38 +691,31 @@ const DEV_OPS = {
         await exportGitCommit(commitSha, releaseDir);
 
         // Patch package.json to use the staging branch from GitHub.
+        // This is a deploy-time override; the exported tag remains the source of truth,
+        // but the install state must be reset so npm does not resolve a stale lockfile
+        // from the pre-override dependency contract.
         const stagingPkgPath = path.join(releaseDir, 'package.json');
         const stagingPkg = JSON.parse(await fs.promises.readFile(stagingPkgPath, 'utf8'));
         const webcompDep = stagingPkg.dependencies?.['abcnorio-webcomponents'];
-        
+
         if (webcompDep && (webcompDep.startsWith('file:') || webcompDep.startsWith('github:'))) {
           stagingPkg.dependencies['abcnorio-webcomponents'] = 'github:madeofpeople/abcnorio-webcomponents#staging';
           await fs.promises.writeFile(stagingPkgPath, JSON.stringify(stagingPkg, null, 2) + '\n', 'utf8');
+          await fs.promises.rm(path.join(releaseDir, 'package-lock.json'), { force: true });
           console.log(`[push-to-staging] patched webcomponents to github:madeofpeople/abcnorio-webcomponents#staging`);
         }
+
+        await assertStagingTreeContract(releaseDir);
+
+        await fs.promises.rm(path.join(releaseDir, 'node_modules'), { recursive: true, force: true });
+        await npmInstallDeterministic(releaseDir);
+        await assertNodeModuleResolvable(releaseDir, 'astro');
+        await assertNodeModuleResolvable(releaseDir, 'shiki');
 
         // Cut over active staging tree from prepared release.
         await clearDirectoryContentsExcept(STAGING_WORKDIR, ['releases', '.push-in-progress']);
         await copyDirectoryContents(releaseDir, STAGING_WORKDIR);
-
-        // Keep active staging tree pinned to GitHub staging branch as well.
-        const activePkgPath = path.join(STAGING_WORKDIR, 'package.json');
-        const activePkg = JSON.parse(await fs.promises.readFile(activePkgPath, 'utf8'));
-        const activeWebcompDep = activePkg.dependencies?.['abcnorio-webcomponents'];
-        if (activeWebcompDep && (activeWebcompDep.startsWith('file:') || activeWebcompDep.startsWith('github:'))) {
-          activePkg.dependencies['abcnorio-webcomponents'] = 'github:madeofpeople/abcnorio-webcomponents#staging';
-          await fs.promises.writeFile(activePkgPath, JSON.stringify(activePkg, null, 2) + '\n', 'utf8');
-        }
-
         await assertStagingTreeContract(STAGING_WORKDIR);
-
-        // Force runtime reinstall/lock refresh in /app context so local file deps resolve correctly.
-        await fs.promises.rm(path.join(STAGING_WORKDIR, 'package-lock.json'), { force: true });
-
-        await fs.promises.rm(path.join(STAGING_WORKDIR, 'node_modules'), { recursive: true, force: true });
-        await npmInstallDeterministic(STAGING_WORKDIR);
-        await assertNodeModuleResolvable(STAGING_WORKDIR, 'astro');
-        await assertNodeModuleResolvable(STAGING_WORKDIR, 'shiki');
 
         await pruneStagingReleaseDirs(STAGING_RELEASES_ROOT, sourceTag);
         await fs.promises.rm(path.join(STAGING_RELEASES_ROOT, STAGING_LAST_FAILED_FILE), { force: true });
