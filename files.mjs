@@ -47,6 +47,31 @@ export function resolveArchiveForTarget(target, requestedName) {
   return archivePath;
 }
 
+export function extractReleaseIdFromArchiveName(target, archiveName) {
+  const name = String(archiveName || '').trim();
+  const prefix = `abcnorio-astro-${target}-`;
+  if (!name.startsWith(prefix) || !name.endsWith('.zip')) {
+    return null;
+  }
+
+  const releaseId = name.slice(prefix.length, -4);
+  if (!releaseId || releaseId.includes('/') || releaseId.includes('\\')) {
+    return null;
+  }
+
+  return releaseId;
+}
+
+export function resolveArchiveForTargetByReleaseId(target, releaseId) {
+  const cleanReleaseId = String(releaseId || '').trim();
+  if (!cleanReleaseId || cleanReleaseId.includes('/') || cleanReleaseId.includes('\\')) {
+    throw new Error('invalid release_id');
+  }
+
+  const archiveName = `abcnorio-astro-${target}-${cleanReleaseId}.zip`;
+  return resolveArchiveForTarget(target, archiveName);
+}
+
 export function runCommand(command, args, env = process.env) {
   return new Promise((resolve) => {
     const proc = spawn(command, args, {
@@ -63,6 +88,7 @@ export function runCommand(command, args, env = process.env) {
 
 export async function restoreArchiveToTarget(target, archivePath, deployBuildPath) {
   const resolvedDeployPath = assertDeployPath(target, deployBuildPath);
+  const expectedRootName = path.basename(resolvedDeployPath);
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'abcnorio-restore-'));
 
   try {
@@ -71,14 +97,16 @@ export async function restoreArchiveToTarget(target, archivePath, deployBuildPat
       throw new Error('failed to extract archive');
     }
 
-    // Candidate archives may come from a different target path (e.g. preview archive restored to production),
-    // so resolve extracted root from archive contents instead of assuming deploy-path basename.
     const extractedEntries = fs.readdirSync(tmpDir, { withFileTypes: true })
       .filter((entry) => entry.isDirectory() && entry.name !== '__MACOSX');
     if (extractedEntries.length !== 1) {
       throw new Error('invalid archive structure');
     }
-    const extractedRoot = path.join(tmpDir, extractedEntries[0].name);
+    const extractedRootEntry = extractedEntries[0];
+    if (extractedRootEntry.name !== expectedRootName) {
+      throw new Error(`invalid archive root: expected ${expectedRootName}, got ${extractedRootEntry.name}`);
+    }
+    const extractedRoot = path.join(tmpDir, extractedRootEntry.name);
 
     const entries = fs.readdirSync(resolvedDeployPath, { withFileTypes: true });
     for (const entry of entries) {

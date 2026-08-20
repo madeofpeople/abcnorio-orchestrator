@@ -37,8 +37,10 @@ function defaultEnvStatus() {
       updatedAt: null,
     },
     latestBackup: null,
+    latestReleaseId: null,
     backups: [],
     lastSmoke: null,
+    releases: [],
   };
 }
 
@@ -77,6 +79,7 @@ function normalizeStatus(input) {
         hasBuild: Boolean(currentBuild.hasBuild),
       },
       backups: Array.isArray(envStatus.backups) ? envStatus.backups : [],
+      releases: Array.isArray(envStatus.releases) ? envStatus.releases : [],
     };
   }
 
@@ -142,7 +145,7 @@ export function markFailed(target, message) {
   });
 }
 
-function recordBackup(status, target, archivePath, sourceCommitSha = null) {
+function recordBackup(status, target, archivePath, sourceCommitSha = null, releaseId = null, checksumSha256 = null) {
   const resolvedPath = path.resolve(archivePath);
   if (!fs.existsSync(resolvedPath)) {
     throw new Error(`backup path does not exist: ${resolvedPath}`);
@@ -158,11 +161,27 @@ function recordBackup(status, target, archivePath, sourceCommitSha = null) {
     mtime: Math.floor(stats.mtimeMs / 1000),
     size: stats.size,
     sourceCommitSha,
+    releaseId,
+    checksumSha256,
   };
 
   envStatus.backups = [backup, ...envStatus.backups.filter((entry) => entry?.name !== name)]
     .slice(0, 12);
   envStatus.latestBackup = backup;
+  envStatus.latestReleaseId = releaseId || envStatus.latestReleaseId;
+
+  if (releaseId) {
+    const release = {
+      releaseId,
+      sourceCommitSha,
+      target,
+      checksumSha256,
+      archivePath: resolvedPath,
+      createdAt: backup.createdAt,
+    };
+    envStatus.releases = [release, ...envStatus.releases.filter((entry) => entry?.releaseId !== releaseId)]
+      .slice(0, 20);
+  }
 }
 
 function hasClientBuild(pathToBuildRoot) {
@@ -171,7 +190,7 @@ function hasClientBuild(pathToBuildRoot) {
     && fs.readdirSync(clientPath).some((entry) => entry !== '.' && entry !== '..');
 }
 
-function recordDeploy(status, target, deployBuildPath) {
+function recordDeploy(status, target, deployBuildPath, releaseId = null, sourceCommitSha = null, checksumSha256 = null, artifactPath = null) {
   const resolvedBuildPath = path.resolve(deployBuildPath);
   const clientPath = path.join(resolvedBuildPath, 'client');
   const hasBuild = hasClientBuild(resolvedBuildPath);
@@ -188,16 +207,39 @@ function recordDeploy(status, target, deployBuildPath) {
     updatedAt: new Date().toISOString(),
     path: resolvedBuildPath,
     hasBuild,
+    releaseId,
+    sourceCommitSha,
+    checksumSha256,
+    artifactPath,
   };
+
+  if (releaseId) {
+    envStatus.latestReleaseId = releaseId;
+  }
 }
 
 export function updateStatus(action, target, payload) {
   const status = loadStatus();
 
   if (action === 'backup') {
-    recordBackup(status, target, payload.archivePath, payload.sourceCommitSha || null);
+    recordBackup(
+      status,
+      target,
+      payload.archivePath,
+      payload.sourceCommitSha || null,
+      payload.releaseId || null,
+      payload.checksumSha256 || null,
+    );
   } else if (action === 'deploy') {
-    recordDeploy(status, target, payload.deployBuildPath);
+    recordDeploy(
+      status,
+      target,
+      payload.deployBuildPath,
+      payload.releaseId || null,
+      payload.sourceCommitSha || null,
+      payload.checksumSha256 || null,
+      payload.artifactPath || null,
+    );
   } else if (action === 'smoke') {
     const envStatus = ensureEnvStatus(status, target);
     envStatus.lastSmoke = {

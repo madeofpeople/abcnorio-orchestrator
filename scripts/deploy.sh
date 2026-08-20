@@ -54,9 +54,10 @@ stage_production_ssr_runtime() {
     rm -rf "${temp_runtime_path}"
     mkdir -p "${temp_runtime_path}"
     cp ./package.json "${temp_runtime_path}/package.json"
+    cp ./package-lock.json "${temp_runtime_path}/package-lock.json"
     (
       cd "${temp_runtime_path}"
-      npm install --omit=dev --package-lock=false
+      npm ci --omit=dev
     )
     cp -R ./dist/server "${temp_runtime_path}/server"
     cp -R ./dist/client "${temp_runtime_path}/client"
@@ -80,11 +81,11 @@ stage_production_ssr_runtime() {
 }
 
 if [ -n "${BUILD_PATH}" ] && [ -d "${BUILD_PATH}" ]; then
-  rm -rf ./abcnorio-webcomponents
-  cp -R /abcnorio-webcomponents ./abcnorio-webcomponents
-  rm -rf ./abcnorio-webcomponents/node_modules
-  npm pkg set dependencies.abcnorio-webcomponents='file:./abcnorio-webcomponents'
-    npm install --package-lock=false
+  if [[ ! -f ./package-lock.json ]]; then
+    echo "package-lock.json is required for deterministic builds"
+    exit 1
+  fi
+    npm ci
     rm -rf ./dist
     export MODE
     export SCOPE

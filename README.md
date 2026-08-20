@@ -24,9 +24,9 @@ deploy-orchestrator/
 
 #### **index.mjs**
 - HTTP server on `ORCHESTRATOR_PORT` (default 4011)
-- Routes: `GET /health`, `GET /status`, `POST /trigger`, `POST /restore`, `GET /dev-tools/status`, `POST /dev-tools/*`
+- Routes: `GET /health`, `GET /status`, `POST /trigger`, `POST /restore` (requires `release_id`), `POST /rollback`, `GET /releases`, `GET /dev-tools/status`, `POST /dev-tools/*`
 - Auth via Bearer token (`ASTRO_BUILD_TRIGGER_SECRET`) — all routes except `/health`
-- Builds the `buildJob` function: calls `deploy.sh`, handles archive contract, and restores a prebuilt production candidate when preview still matches
+- Builds the `buildJob` function: calls `deploy.sh`, enforces target-scoped archive contract, and deploys target-native artifacts only
 - Graceful shutdown on SIGTERM/SIGINT: stops accepting requests, waits for queue to drain
 
 #### **queue.mjs**

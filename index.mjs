@@ -1,16 +1,19 @@
-import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
+import { Hono } from 'hono';
+import { serve } from '@hono/node-server';
+import { z } from 'zod';
 import { enqueue, getQueueStatus } from './queue.mjs';
 import { devToolsState, startDevOp, copyMediaFiles, createMediaBackupArchive, dumpDatabase, uploads, db, assertUploadsContract } from './dev-tools.mjs';
-import { getAuthToken, readJsonBody } from './http.mjs';
 import {
   listArchivesForTarget,
   runCommand,
   assertDeployPath,
   cleanupOldArchives,
-  resolveArchiveForTarget,
+  resolveArchiveForTargetByReleaseId,
+  extractReleaseIdFromArchiveName,
   restoreArchiveToTarget,
 } from './files.mjs';
 import {
@@ -110,6 +113,7 @@ const TARGETS = {
 const PRODUCTION_HOST = (process.env.PRODUCTION_HOST || '').replace(/\/$/, '');
 const PREVIEW_HOST = (process.env.PREVIEW_HOST || '').replace(/\/$/, '');
 const SMOKE_HTTP_TIMEOUT_MS = Number(process.env.ORCHESTRATOR_SMOKE_HTTP_TIMEOUT_MS || 10000);
+const MEDIA_SYNC_TARGETS = ['dev', 'staging'];
 
 assertRequiredEnvVars(REQUIRED_ENV);
 
@@ -368,62 +372,6 @@ async function runGitCommand(args) {
   });
 }
 
-async function gitIsAncestor(ancestorRef, descendantRef) {
-  return new Promise((resolve, reject) => {
-    const proc = spawn('git', ['merge-base', '--is-ancestor', ancestorRef, descendantRef], {
-      cwd: SOURCE_GIT_ROOT,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    let stderr = '';
-    proc.stderr.on('data', (d) => { stderr += d.toString(); });
-    proc.on('close', (code) => {
-      if (code === 0) {
-        resolve(true);
-        return;
-      }
-
-      if (code === 1) {
-        resolve(false);
-        return;
-      }
-
-      reject(new Error(`Failed ancestry check ${ancestorRef} -> ${descendantRef}: ${stderr.trim()}`));
-    });
-    proc.on('error', (err) => {
-      reject(new Error(`git process error: ${err.message}`));
-    });
-  });
-}
-
-async function fastForwardBranch(branchName, commitSha) {
-  const existingBranchSha = await resolveGitRefIfExists(branchName);
-  if (existingBranchSha) {
-    const isAncestor = await gitIsAncestor(existingBranchSha, commitSha);
-    if (!isAncestor) {
-      throw new Error(`refusing non-fast-forward update for ${branchName}: ${existingBranchSha} is not ancestor of ${commitSha}`);
-    }
-  }
-
-  const updateArgs = ['update-ref', `refs/heads/${branchName}`, commitSha];
-  if (existingBranchSha) {
-    updateArgs.push(existingBranchSha);
-  }
-  await runGitCommand(updateArgs);
-  await runGitCommand(['push', 'origin', `refs/heads/${branchName}:refs/heads/${branchName}`]);
-}
-
-async function assertFastForwardPossible(branchName, commitSha) {
-  const existingBranchSha = await resolveGitRefIfExists(branchName);
-  if (!existingBranchSha) {
-    return;
-  }
-
-  const isAncestor = await gitIsAncestor(existingBranchSha, commitSha);
-  if (!isAncestor) {
-    throw new Error(`refusing non-fast-forward update for ${branchName}: ${existingBranchSha} is not ancestor of ${commitSha}`);
-  }
-}
-
 async function tagProductionDeploy(commitSha, deployedAt) {
   const deployDate = new Date(deployedAt).toISOString().slice(0, 10);
   const shortSha = commitSha.slice(0, 7);
@@ -444,11 +392,11 @@ async function tagProductionDeploy(commitSha, deployedAt) {
 }
 
 // Export specific git commit tree to target directory via git archive
-async function exportGitCommit(commitSha, targetDir) {
+async function exportGitCommit(commitSha, targetDir, gitSubdir = SOURCE_GIT_SUBDIR) {
   return new Promise((resolve, reject) => {
     const archiveArgs = ['archive', '--format=tar', commitSha];
-    if (SOURCE_GIT_SUBDIR) {
-      archiveArgs.push(SOURCE_GIT_SUBDIR);
+    if (gitSubdir) {
+      archiveArgs.push(gitSubdir);
     }
 
     // Use tar format to preserve file permissions and symlinks
@@ -457,7 +405,7 @@ async function exportGitCommit(commitSha, targetDir) {
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
-    const stripComponents = SOURCE_GIT_SUBDIR ? SOURCE_GIT_SUBDIR.split('/').length : 0;
+    const stripComponents = gitSubdir ? gitSubdir.split('/').length : 0;
     const extractArgs = ['-xf', '-', '-C', targetDir];
     if (stripComponents > 0) {
       extractArgs.push(`--strip-components=${stripComponents}`);
@@ -486,40 +434,6 @@ async function exportGitCommit(commitSha, targetDir) {
     });
     tarPath.on('error', (err) => {
       reject(new Error(`tar error: ${err.message}`));
-    });
-  });
-}
-
-// Run npm install in a directory
-async function npmInstall(dir) {
-  return new Promise((resolve, reject) => {
-    const proc = spawn('npm', ['install', '--package-lock=false'], {
-      cwd: dir,
-      env: npmSpawnEnv(),
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    let stderr = '';
-    let stdout = '';
-    let exitCode = null;
-    let exitSignal = null;
-    proc.stdout.on('data', (d) => { stdout += d.toString(); });
-    proc.stderr.on('data', (d) => { stderr += d.toString(); });
-    proc.on('exit', (code, signal) => {
-      exitCode = code;
-      exitSignal = signal;
-    });
-    proc.on('close', () => {
-      if (exitCode === 0) {
-        resolve();
-      } else {
-        const stderrTail = stderr.trim().split('\n').slice(-30).join('\n');
-        const stdoutTail = stdout.trim().split('\n').slice(-30).join('\n');
-        const reason = stderrTail || stdoutTail || 'no npm output captured';
-        reject(new Error(`npm install failed (code=${String(exitCode)}, signal=${String(exitSignal)}): ${reason}`));
-      }
-    });
-    proc.on('error', (err) => {
-      reject(new Error(`npm process error: ${err.message}`));
     });
   });
 }
@@ -559,20 +473,54 @@ async function npmCi(dir) {
 
 async function npmInstallDeterministic(dir) {
   const hasLock = fs.existsSync(path.join(dir, 'package-lock.json'));
-  if (hasLock) {
-    try {
-      await npmCi(dir);
-      return;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      console.warn(`[npm-install] npm ci failed in ${dir}; falling back to npm install --package-lock=false`);
-      console.warn(`[npm-install] ci error: ${message}`);
-      await npmInstall(dir);
-      return;
-    }
+  if (!hasLock) {
+    throw new Error(`npm ci requires package-lock.json in ${dir}`);
   }
 
-  return npmInstall(dir);
+  await npmCi(dir);
+}
+
+function parseJsonFile(filePath, label) {
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch (error) {
+    throw new Error(`${label} parse failed at ${filePath}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (!parsed || typeof parsed !== 'object') {
+    throw new Error(`${label} invalid JSON object at ${filePath}`);
+  }
+  return parsed;
+}
+
+function assertStagingWebcomponentsContract(stagingRoot) {
+  const packageJsonPath = path.join(stagingRoot, 'package.json');
+  const packageLockPath = path.join(stagingRoot, 'package-lock.json');
+
+  if (!fs.existsSync(packageJsonPath)) {
+    throw new Error(`staging package missing at ${packageJsonPath}`);
+  }
+  if (!fs.existsSync(packageLockPath)) {
+    throw new Error(`staging lockfile missing at ${packageLockPath}`);
+  }
+
+  const pkg = parseJsonFile(packageJsonPath, 'package.json');
+  if (!pkg.dependencies || typeof pkg.dependencies !== 'object') {
+    throw new Error('staging package.json missing dependencies object');
+  }
+
+  const currentDep = String(pkg.dependencies['abcnorio-webcomponents'] || '').trim();
+  if (!currentDep.startsWith('github:') || !currentDep.includes('#')) {
+    throw new Error(`staging contract violation: abcnorio-webcomponents must be git-pinned (github:*#ref), got "${currentDep || '(empty)'}"`);
+  }
+
+  const lockText = fs.readFileSync(packageLockPath, 'utf8');
+  if (lockText.includes('"file:../../abcnorio-webcomponents"')) {
+    throw new Error('staging lockfile contract violation: contains file:../../abcnorio-webcomponents');
+  }
+  if (lockText.includes('"../../abcnorio-webcomponents"')) {
+    throw new Error('staging lockfile contract violation: contains local ../../abcnorio-webcomponents entry');
+  }
 }
 
 async function assertReadablePath(targetPath, label) {
@@ -621,6 +569,90 @@ async function assertNodeModuleResolvable(stagingRoot, moduleName) {
       reject(new Error(`node process error (${moduleName}): ${err.message}`));
     });
   });
+}
+
+async function checksumFileSha256(filePath) {
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash('sha256');
+    const stream = fs.createReadStream(filePath);
+    stream.on('error', (err) => reject(new Error(`failed to read artifact for checksum: ${err.message}`)));
+    stream.on('data', (chunk) => hash.update(chunk));
+    stream.on('end', () => resolve(hash.digest('hex')));
+  });
+}
+
+function getTargetEnvStatus(target) {
+  const status = loadStatus();
+  const envStatus = status?.envs?.[target];
+  if (!envStatus || typeof envStatus !== 'object') {
+    throw new Error(`missing status for target=${target}`);
+  }
+  return envStatus;
+}
+
+function getReleaseMetadata(target, releaseId) {
+  if (!releaseId) {
+    return null;
+  }
+
+  const envStatus = getTargetEnvStatus(target);
+  const releases = Array.isArray(envStatus.releases) ? envStatus.releases : [];
+  return releases.find((entry) => entry?.releaseId === releaseId) || null;
+}
+
+function resolveRollbackReleaseId(target) {
+  const envStatus = getTargetEnvStatus(target);
+  const releases = Array.isArray(envStatus.releases) ? envStatus.releases : [];
+  if (releases.length < 2) {
+    throw new Error(`no previous release available for rollback target=${target}`);
+  }
+
+  return String(releases[1].releaseId || '').trim();
+}
+
+async function deployReleaseArtifact(target, deployBuildPath, archivePath, sourceCommitSha = null) {
+  const resolvedArchivePath = path.resolve(archivePath);
+  const releaseId = extractReleaseIdFromArchiveName(target, path.basename(resolvedArchivePath));
+  const checksumSha256 = await checksumFileSha256(resolvedArchivePath);
+  const releaseMeta = getReleaseMetadata(target, releaseId);
+
+  if (releaseMeta?.checksumSha256 && releaseMeta.checksumSha256 !== checksumSha256) {
+    throw new Error(`artifact checksum mismatch for release_id=${releaseId}`);
+  }
+
+  const restoredPath = await restoreArchiveToTarget(target, resolvedArchivePath, deployBuildPath);
+
+  updateStatus('deploy', target, {
+    deployBuildPath: restoredPath,
+    releaseId,
+    sourceCommitSha: sourceCommitSha || releaseMeta?.sourceCommitSha || null,
+    checksumSha256,
+    artifactPath: resolvedArchivePath,
+  });
+
+  const smokeResults = await runSmokeChecks(target, restoredPath);
+  updateStatus('smoke', target, smokeResults);
+  if (!smokeResults.passed) {
+    const failedNames = smokeResults.checks
+      .filter((c) => c.severity === 'required' && c.status === 'failed')
+      .map((c) => c.name)
+      .join(', ');
+    throw new Error(`smoke checks failed after deploy release_id=${releaseId}: ${failedNames}`);
+  }
+
+  return {
+    restoredPath,
+    releaseId,
+    checksumSha256,
+  };
+}
+
+function isKnownDeployTarget(target) {
+  return Boolean(TARGETS[target]);
+}
+
+function isKnownMediaTarget(target) {
+  return MEDIA_SYNC_TARGETS.includes(target);
 }
 
 const DEV_OPS = {
@@ -672,8 +704,8 @@ const DEV_OPS = {
       const sentinelPath = path.join(STAGING_WORKDIR, '.push-in-progress');
       const stagingTagPrefix = 'staging-deploy-';
       let sourceTag = '';
-      
-      try { fs.writeFileSync(sentinelPath, ''); } catch { }
+
+      fs.writeFileSync(sentinelPath, '');
       try {
         sourceTag = String(requestBody.tag || '').trim();
         if (sourceTag) {
@@ -688,24 +720,10 @@ const DEV_OPS = {
         const releaseDir = path.join(STAGING_RELEASES_ROOT, sourceTag);
         await clearDirectoryContents(releaseDir);
         console.log(`[push-to-staging] exporting commit ${commitSha} to release ${releaseDir}`);
-        await exportGitCommit(commitSha, releaseDir);
-
-        // Patch package.json to use the staging branch from GitHub.
-        // This is a deploy-time override; the exported tag remains the source of truth,
-        // but the install state must be reset so npm does not resolve a stale lockfile
-        // from the pre-override dependency contract.
-        const stagingPkgPath = path.join(releaseDir, 'package.json');
-        const stagingPkg = JSON.parse(await fs.promises.readFile(stagingPkgPath, 'utf8'));
-        const webcompDep = stagingPkg.dependencies?.['abcnorio-webcomponents'];
-
-        if (webcompDep && (webcompDep.startsWith('file:') || webcompDep.startsWith('github:'))) {
-          stagingPkg.dependencies['abcnorio-webcomponents'] = 'github:madeofpeople/abcnorio-webcomponents#staging';
-          await fs.promises.writeFile(stagingPkgPath, JSON.stringify(stagingPkg, null, 2) + '\n', 'utf8');
-          await fs.promises.rm(path.join(releaseDir, 'package-lock.json'), { force: true });
-          console.log(`[push-to-staging] patched webcomponents to github:madeofpeople/abcnorio-webcomponents#staging`);
-        }
+        await exportGitCommit(commitSha, releaseDir, SOURCE_GIT_SUBDIR);
 
         await assertStagingTreeContract(releaseDir);
+        assertStagingWebcomponentsContract(releaseDir);
 
         await fs.promises.rm(path.join(releaseDir, 'node_modules'), { recursive: true, force: true });
         await npmInstallDeterministic(releaseDir);
@@ -717,6 +735,12 @@ const DEV_OPS = {
         await copyDirectoryContents(releaseDir, STAGING_WORKDIR);
         await assertStagingTreeContract(STAGING_WORKDIR);
 
+        // Re-run deterministic install in active staging root to ensure local
+        // node_modules symlinks are rooted in /app for the astro-staging container.
+        await npmInstallDeterministic(STAGING_WORKDIR);
+        await assertNodeModuleResolvable(STAGING_WORKDIR, 'astro');
+        await assertNodeModuleResolvable(STAGING_WORKDIR, 'shiki');
+
         await pruneStagingReleaseDirs(STAGING_RELEASES_ROOT, sourceTag);
         await fs.promises.rm(path.join(STAGING_RELEASES_ROOT, STAGING_LAST_FAILED_FILE), { force: true });
 
@@ -727,12 +751,16 @@ const DEV_OPS = {
             await fs.promises.mkdir(STAGING_RELEASES_ROOT, { recursive: true });
             await fs.promises.writeFile(path.join(STAGING_RELEASES_ROOT, STAGING_LAST_FAILED_FILE), `${sourceTag}\n`, 'utf8');
           }
-        } catch {
-          // ignore failure marker write errors; do not mask root failure
+        } catch (markerError) {
+          console.warn(`[push-to-staging] failed to persist last-failed marker: ${markerError instanceof Error ? markerError.message : String(markerError)}`);
         }
         throw error;
       } finally {
-        try { fs.unlinkSync(sentinelPath); } catch { }
+        try {
+          fs.unlinkSync(sentinelPath);
+        } catch (unlinkError) {
+          console.warn(`[push-to-staging] failed to remove in-progress sentinel: ${unlinkError instanceof Error ? unlinkError.message : String(unlinkError)}`);
+        }
       }
     },
   }),
@@ -827,7 +855,7 @@ function normalizeScope(scope) {
     return candidate;
   }
 
-  return 'full';
+  throw new Error(`invalid scope: ${scope}`);
 }
 
 async function buildJob(target, scope) {
@@ -882,24 +910,18 @@ async function buildJob(target, scope) {
   }
 
   const archivePath = path.join(STATIC_ARCHIVE_DIR, createdArchive);
+  const releaseId = extractReleaseIdFromArchiveName(target, createdArchive);
+  const checksumSha256 = await checksumFileSha256(archivePath);
   console.log(`[worker] ${target} found archive: ${path.basename(archivePath)}`);
   cleanupOldArchives(target, MAX_BACKUPS);
-  updateStatus('backup', target, { archivePath, sourceCommitSha });
-  updateStatus('deploy', target, { deployBuildPath: resolvedDeployPath });
-
-  const smokeResults = await runSmokeChecks(target, resolvedDeployPath);
-  updateStatus('smoke', target, smokeResults);
-  if (!smokeResults.passed) {
-    const failedNames = smokeResults.checks
-      .filter(c => c.severity === 'required' && c.status === 'failed')
-      .map(c => c.name).join(', ');
-    const message = `smoke checks failed: ${failedNames}`;
-    setRuntimeState({ status: 'failed', target, started: startedAt, finished: Date.now(), exitCode: 0, message });
-    markFailed(target, message);
-    console.log(`[worker] ${target} smoke failed: ${failedNames}`);
-    throw new Error(message);
-  }
-  console.log(`[worker] ${target} smoke checks passed (${smokeResults.durationMs}ms)`);
+  updateStatus('backup', target, {
+    archivePath,
+    sourceCommitSha,
+    releaseId,
+    checksumSha256,
+  });
+  const deployedRelease = await deployReleaseArtifact(target, resolvedDeployPath, archivePath, sourceCommitSha);
+  console.log(`[worker] ${target} deployed release_id=${deployedRelease.releaseId || 'unknown'} checksum=${deployedRelease.checksumSha256}`);
   setRuntimeState({
     status: 'done',
     target,
@@ -927,186 +949,292 @@ function enqueueTarget(target, source = 'manual', scope = 'full') {
   }
   return result;
 }
+const app = new Hono();
 
-const server = http.createServer(async (req, res) => {
-  const requestUrl = new URL(req.url || '/', 'http://127.0.0.1');
-  const pathname = requestUrl.pathname;
-
-  const respond = (code, data) => {
-    res.writeHead(code, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(data));
-  };
-
-  if (req.method === 'GET' && pathname === '/health') {
-    return respond(200, { status: 'ok' });
-  }
-
-  if (!SECRET || getAuthToken(req) !== SECRET) {
-    return respond(401, { error: 'unauthorized' });
-  }
-
-  if (req.method === 'GET' && pathname === '/status') {
-    return respond(200, getRuntimeState());
-  }
-
-  if (req.method === 'POST' && pathname === '/trigger') {
-    let body = {};
-    try {
-      body = await readJsonBody(req);
-    } catch {
-      return respond(400, { error: 'invalid json' });
-    }
-
-    const target = String(body.target || '').trim();
-    const source = String(body.source || 'manual').trim();
-    const scope = normalizeScope(String(body.scope || 'full').trim());
-
-    if (!TARGETS[target]) {
-      return respond(400, { error: 'invalid target', valid: Object.keys(TARGETS) });
-    }
-
-    if (source === 'manual' && !ALLOW_MANUAL_TRIGGER) {
-      return respond(403, { error: 'manual trigger is disabled' });
-    }
-
-    if (source === 'save' && target === 'production') {
-      return respond(403, { error: 'production save-trigger is disabled' });
-    }
-
-    const result = enqueueTarget(target, source, scope);
-    if (!result.accepted) {
-      return respond(409, { error: 'build already queued' });
-    }
-    return respond(202, { status: 'queued', target, source, scope });
-  }
-
-  if (req.method === 'POST' && pathname === '/restore') {
-    let body = {};
-    try {
-      body = await readJsonBody(req);
-    } catch {
-      return respond(400, { error: 'invalid json' });
-    }
-
-    const target = String(body.target || '').trim();
-    const file = String(body.file || '').trim();
-
-    if (!TARGETS[target]) {
-      return respond(400, { error: 'invalid target', valid: Object.keys(TARGETS) });
-    }
-
-    try {
-      const archivePath = resolveArchiveForTarget(target, file);
-      const deployBuildPath = TARGETS[target];
-      const restoredPath = await restoreArchiveToTarget(target, archivePath, deployBuildPath);
-      updateStatus('deploy', target, { deployBuildPath: restoredPath });
-      return respond(200, {
-        status: 'restored',
-        target,
-        file,
-      });
-    } catch (error) {
-      return respond(400, {
-        error: 'restore failed',
-        message: error instanceof Error ? error.message : 'unknown error',
-      });
-    }
-  }
-
-  if (req.method === 'GET' && pathname === '/dev-tools/status') {
-    return respond(200, devToolsState);
-  }
-
-  if (req.method === 'GET' && pathname === '/dev-tools/media-backups') {
-    const target = String(requestUrl.searchParams.get('target') || '').trim();
-    if (!['dev', 'staging'].includes(target)) {
-      return respond(400, { error: 'invalid target', valid: ['dev', 'staging'] });
-    }
-
-    return respond(200, {
-      target,
-      backups: listMediaBackups(target),
-    });
-  }
-
-  if (req.method === 'GET' && pathname === '/dev-tools/media-backups/download') {
-    const target = String(requestUrl.searchParams.get('target') || '').trim();
-    const file = String(requestUrl.searchParams.get('file') || '').trim();
-    if (!['dev', 'staging'].includes(target)) {
-      return respond(400, { error: 'invalid target', valid: ['dev', 'staging'] });
-    }
-
-    try {
-      const archivePath = resolveMediaBackupArchive(target, file);
-      const stat = fs.statSync(archivePath);
-      res.writeHead(200, {
-        'Content-Type': 'application/zip',
-        'Content-Disposition': `attachment; filename="${path.basename(archivePath)}"`,
-        'Content-Length': String(stat.size),
-      });
-      fs.createReadStream(archivePath).pipe(res);
-      return;
-    } catch (error) {
-      return respond(404, {
-        error: 'archive not found',
-        message: error instanceof Error ? error.message : 'unknown error',
-      });
-    }
-  }
-
-  if (req.method === 'POST' && pathname === '/dev-tools/media-backups/delete') {
-    let body = {};
-    try {
-      body = await readJsonBody(req);
-    } catch {
-      return respond(400, { error: 'invalid json' });
-    }
-
-    const target = String(body.target || '').trim();
-    const file = String(body.file || '').trim();
-    if (!['dev', 'staging'].includes(target)) {
-      return respond(400, { error: 'invalid target', valid: ['dev', 'staging'] });
-    }
-
-    try {
-      const archivePath = resolveMediaBackupArchive(target, file);
-      fs.unlinkSync(archivePath);
-      return respond(200, { status: 'deleted', target, file });
-    } catch (error) {
-      return respond(404, {
-        error: 'delete failed',
-        message: error instanceof Error ? error.message : 'unknown error',
-      });
-    }
-  }
-
-  if (req.method === 'POST' && DEV_OPS[pathname]) {
-    let body = {};
-    try {
-      body = await readJsonBody(req);
-    } catch (err) {
-      // If body read fails, continue with empty body for backwards compat
-      console.log(`[dev-tools] ignoring body read error: ${err.message}`);
-    }
-    
-    // DEV_OPS entries can be operation objects or factory functions
-    const opDefOrFactory = DEV_OPS[pathname];
-    const op = typeof opDefOrFactory === 'function' ? opDefOrFactory(body) : opDefOrFactory;
-    
-    if (op.requiresStaging && !STAGING_WORKDIR) {
-      return respond(500, { error: 'ASTRO_STAGING_SITE_ROOT is not configured' });
-    }
-    if (op.requiresDb && (!db.dev.name || !db.staging.name)) {
-      return respond(500, { error: 'DB env vars not configured (DEV_DB_NAME / STAGING_DB_NAME)' });
-    }
-    const started = startDevOp(op.key, op.label, op.run);
-    return respond(started ? 202 : 409, started ? { status: 'running' } : { error: 'already in progress' });
-  }
-
-  respond(404, { error: 'not found' });
+const TriggerBodySchema = z.object({
+  target: z.string().trim().min(1),
+  source: z.string().trim().default('manual'),
+  scope: z.string().trim().default('full'),
 });
 
-server.listen(PORT, '0.0.0.0', () => {
+const RestoreBodySchema = z.object({
+  target: z.string().trim().min(1),
+  release_id: z.string().trim().min(1).optional(),
+  releaseId: z.string().trim().min(1).optional(),
+});
+
+const RollbackBodySchema = z.object({
+  target: z.string().trim().min(1),
+  release_id: z.string().trim().optional(),
+  releaseId: z.string().trim().optional(),
+});
+
+const MediaDeleteBodySchema = z.object({
+  target: z.string().trim().min(1),
+  file: z.string().trim().min(1),
+});
+
+const DevToolsPushBodySchema = z.object({
+  tag: z.string().trim().optional(),
+});
+
+function jsonOk(c, code, data = {}) {
+  return c.json({ ok: true, data }, code);
+}
+
+function jsonError(c, code, errorCode, message, details = undefined) {
+  const error = {
+    code: String(errorCode || 'error'),
+    message: String(message || 'request failed'),
+  };
+  if (details !== undefined) {
+    error.details = details;
+  }
+  return c.json({ ok: false, error }, code);
+}
+
+async function parseBody(c, schema) {
+  let raw;
+  try {
+    raw = await c.req.json();
+  } catch {
+    return { ok: false, response: jsonError(c, 400, 'invalid_json', 'invalid json') };
+  }
+
+  const parsed = schema.safeParse(raw);
+  if (!parsed.success) {
+    return {
+      ok: false,
+      response: jsonError(c, 400, 'invalid_body', 'invalid request body', parsed.error.flatten()),
+    };
+  }
+
+  return { ok: true, data: parsed.data };
+}
+
+const deployArchiveForTarget = async (target, archivePath, sourceCommitSha = null) => {
+  const deployBuildPath = TARGETS[target];
+  return deployReleaseArtifact(target, deployBuildPath, archivePath, sourceCommitSha);
+};
+
+app.get('/health', (c) => jsonOk(c, 200, { status: 'ok' }));
+
+app.use('*', async (c, next) => {
+  const auth = c.req.header('authorization') || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice('Bearer '.length).trim() : '';
+  if (!SECRET || token !== SECRET) {
+    return jsonError(c, 401, 'unauthorized', 'unauthorized');
+  }
+  await next();
+});
+
+app.get('/status', (c) => jsonOk(c, 200, getRuntimeState()));
+
+app.post('/trigger', async (c) => {
+  const parsed = await parseBody(c, TriggerBodySchema);
+  if (!parsed.ok) {
+    return parsed.response;
+  }
+
+  const target = parsed.data.target;
+  const source = parsed.data.source;
+  let scope = 'full';
+  try {
+    scope = normalizeScope(parsed.data.scope);
+  } catch (error) {
+    return jsonError(c, 400, 'invalid_scope', error instanceof Error ? error.message : 'unknown scope error');
+  }
+
+  if (!isKnownDeployTarget(target)) {
+    return jsonError(c, 400, 'invalid_target', 'invalid target', { valid: Object.keys(TARGETS) });
+  }
+  if (source === 'manual' && !ALLOW_MANUAL_TRIGGER) {
+    return jsonError(c, 403, 'manual_trigger_disabled', 'manual trigger is disabled');
+  }
+  if (source === 'save' && target === 'production') {
+    return jsonError(c, 403, 'production_save_trigger_disabled', 'production save-trigger is disabled');
+  }
+
+  const result = enqueueTarget(target, source, scope);
+  if (!result.accepted) {
+    return jsonError(c, 409, 'build_already_queued', 'build already queued');
+  }
+
+  return jsonOk(c, 202, { status: 'queued', target, source, scope });
+});
+
+app.post('/restore', async (c) => {
+  const parsed = await parseBody(c, RestoreBodySchema);
+  if (!parsed.ok) {
+    return parsed.response;
+  }
+
+  const target = parsed.data.target;
+  const releaseId = String(parsed.data.release_id || parsed.data.releaseId || '').trim();
+  if (!isKnownDeployTarget(target)) {
+    return jsonError(c, 400, 'invalid_target', 'invalid target', { valid: Object.keys(TARGETS) });
+  }
+  if (!releaseId) {
+    return jsonError(c, 400, 'missing_release_id', 'release_id is required');
+  }
+
+  try {
+    const archivePath = resolveArchiveForTargetByReleaseId(target, releaseId);
+    const deployment = await deployArchiveForTarget(target, archivePath);
+    return jsonOk(c, 200, {
+      status: 'restored',
+      target,
+      file: path.basename(archivePath),
+      release_id: deployment.releaseId,
+      checksum_sha256: deployment.checksumSha256,
+    });
+  } catch (error) {
+    return jsonError(c, 400, 'restore_failed', error instanceof Error ? error.message : 'unknown error');
+  }
+});
+
+app.post('/rollback', async (c) => {
+  const parsed = await parseBody(c, RollbackBodySchema);
+  if (!parsed.ok) {
+    return parsed.response;
+  }
+
+  const target = parsed.data.target;
+  const releaseId = String(parsed.data.release_id || parsed.data.releaseId || '').trim();
+  if (!isKnownDeployTarget(target)) {
+    return jsonError(c, 400, 'invalid_target', 'invalid target', { valid: Object.keys(TARGETS) });
+  }
+
+  try {
+    const selectedReleaseId = releaseId || resolveRollbackReleaseId(target);
+    const archivePath = resolveArchiveForTargetByReleaseId(target, selectedReleaseId);
+    const deployment = await deployArchiveForTarget(target, archivePath);
+    return jsonOk(c, 200, {
+      status: 'rolled_back',
+      target,
+      release_id: deployment.releaseId,
+      checksum_sha256: deployment.checksumSha256,
+    });
+  } catch (error) {
+    return jsonError(c, 400, 'rollback_failed', error instanceof Error ? error.message : 'unknown error');
+  }
+});
+
+app.get('/releases', (c) => {
+  const target = String(c.req.query('target') || '').trim();
+  if (!isKnownDeployTarget(target)) {
+    return jsonError(c, 400, 'invalid_target', 'invalid target', { valid: Object.keys(TARGETS) });
+  }
+
+  const envStatus = getTargetEnvStatus(target);
+  return jsonOk(c, 200, {
+    target,
+    latest_release_id: envStatus.latestReleaseId || null,
+    releases: Array.isArray(envStatus.releases) ? envStatus.releases : [],
+  });
+});
+
+app.get('/dev-tools/status', (c) => jsonOk(c, 200, devToolsState));
+
+app.get('/dev-tools/media-backups', (c) => {
+  const target = String(c.req.query('target') || '').trim();
+  if (!isKnownMediaTarget(target)) {
+    return jsonError(c, 400, 'invalid_target', 'invalid target', { valid: MEDIA_SYNC_TARGETS });
+  }
+  return jsonOk(c, 200, {
+    target,
+    backups: listMediaBackups(target),
+  });
+});
+
+app.get('/dev-tools/media-backups/download', (c) => {
+  const target = String(c.req.query('target') || '').trim();
+  const file = String(c.req.query('file') || '').trim();
+  if (!isKnownMediaTarget(target)) {
+    return jsonError(c, 400, 'invalid_target', 'invalid target', { valid: MEDIA_SYNC_TARGETS });
+  }
+
+  try {
+    const archivePath = resolveMediaBackupArchive(target, file);
+    const stat = fs.statSync(archivePath);
+    const stream = fs.createReadStream(archivePath);
+    c.header('Content-Type', 'application/zip');
+    c.header('Content-Disposition', `attachment; filename="${path.basename(archivePath)}"`);
+    c.header('Content-Length', String(stat.size));
+    return c.body(stream, 200);
+  } catch (error) {
+    return jsonError(c, 404, 'archive_not_found', error instanceof Error ? error.message : 'unknown error');
+  }
+});
+
+app.post('/dev-tools/media-backups/delete', async (c) => {
+  const parsed = await parseBody(c, MediaDeleteBodySchema);
+  if (!parsed.ok) {
+    return parsed.response;
+  }
+
+  const target = parsed.data.target;
+  const file = parsed.data.file;
+  if (!isKnownMediaTarget(target)) {
+    return jsonError(c, 400, 'invalid_target', 'invalid target', { valid: MEDIA_SYNC_TARGETS });
+  }
+
+  try {
+    const archivePath = resolveMediaBackupArchive(target, file);
+    fs.unlinkSync(archivePath);
+    return jsonOk(c, 200, { status: 'deleted', target, file });
+  } catch (error) {
+    return jsonError(c, 404, 'delete_failed', error instanceof Error ? error.message : 'unknown error');
+  }
+});
+
+app.post('/dev-tools/push-to-staging', async (c) => {
+  const parsed = await parseBody(c, DevToolsPushBodySchema);
+  if (!parsed.ok) {
+    return parsed.response;
+  }
+
+  const op = DEV_OPS['/dev-tools/push-to-staging'](parsed.data);
+  if (op.requiresStaging && !STAGING_WORKDIR) {
+    return jsonError(c, 500, 'staging_root_missing', 'ASTRO_STAGING_SITE_ROOT is not configured');
+  }
+  if (op.requiresDb && (!db.dev.name || !db.staging.name)) {
+    return jsonError(c, 500, 'db_env_missing', 'DB env vars not configured (DEV_DB_NAME / STAGING_DB_NAME)');
+  }
+  const started = startDevOp(op.key, op.label, op.run);
+  if (!started) {
+    return jsonError(c, 409, 'already_in_progress', 'already in progress');
+  }
+  return jsonOk(c, 202, { status: 'running' });
+});
+
+app.post('/dev-tools/:op', async (c) => {
+  const opPath = `/dev-tools/${c.req.param('op')}`;
+  const opDef = DEV_OPS[opPath];
+  if (!opDef || typeof opDef === 'function') {
+    return jsonError(c, 404, 'not_found', 'not found');
+  }
+
+  if (opDef.requiresStaging && !STAGING_WORKDIR) {
+    return jsonError(c, 500, 'staging_root_missing', 'ASTRO_STAGING_SITE_ROOT is not configured');
+  }
+  if (opDef.requiresDb && (!db.dev.name || !db.staging.name)) {
+    return jsonError(c, 500, 'db_env_missing', 'DB env vars not configured (DEV_DB_NAME / STAGING_DB_NAME)');
+  }
+  const started = startDevOp(opDef.key, opDef.label, opDef.run);
+  if (!started) {
+    return jsonError(c, 409, 'already_in_progress', 'already in progress');
+  }
+  return jsonOk(c, 202, { status: 'running' });
+});
+
+app.all('*', (c) => jsonError(c, 404, 'not_found', 'not found'));
+
+const server = serve({
+  fetch: app.fetch,
+  port: PORT,
+  hostname: '0.0.0.0',
+}, () => {
   saveStatus(loadStatus());
   console.log(`[deploy-orchestrator] listening on :${PORT}`);
 });

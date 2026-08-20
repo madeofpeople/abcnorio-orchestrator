@@ -1,7 +1,12 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
-HOST="${PRODUCTION_HOST}"
+HOST="${PRODUCTION_HOST:-}"
+
+if [[ -z "${HOST}" ]]; then
+    echo "Missing PRODUCTION_HOST for cache warm." >&2
+    exit 1
+fi
 
 URLS=(
     "${HOST}/events/listing?date-filter=ongoing-and-upcoming&order=desc"
