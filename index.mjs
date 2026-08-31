@@ -393,47 +393,58 @@ async function tagProductionDeploy(commitSha, deployedAt) {
 
 // Export specific git commit tree to target directory via git archive
 async function exportGitCommit(commitSha, targetDir, gitSubdir = SOURCE_GIT_SUBDIR) {
+  const archivePath = path.join(targetDir, '.tmp-git-export.tar');
+  fs.rmSync(archivePath, { force: true });
+
   return new Promise((resolve, reject) => {
-    const archiveArgs = ['archive', '--format=tar', commitSha];
+    const archiveArgs = ['archive', '--format=tar', '--output', archivePath, commitSha];
     if (gitSubdir) {
-      archiveArgs.push(gitSubdir);
+      archiveArgs.push('--', gitSubdir);
     }
 
-    // Use tar format to preserve file permissions and symlinks
-    const tarProc = spawn('git', archiveArgs, {
+    const gitProc = spawn('git', archiveArgs, {
       cwd: SOURCE_GIT_ROOT,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
-    const stripComponents = gitSubdir ? gitSubdir.split('/').length : 0;
-    const extractArgs = ['-xf', '-', '-C', targetDir];
-    if (stripComponents > 0) {
-      extractArgs.push(`--strip-components=${stripComponents}`);
-    }
-
-    // Extract tar stream directly to target directory
-    const tarPath = spawn('tar', extractArgs, {
-      stdio: [tarProc.stdout, 'pipe', 'pipe'],
-    });
-    
-    let tarErr = '';
-    let extractErr = '';
-    tarProc.stderr.on('data', (d) => { tarErr += d.toString(); });
-    tarProc.on('error', (err) => {
-      tarProc.kill();
+    let gitErr = '';
+    gitProc.stderr.on('data', (d) => { gitErr += d.toString(); });
+    gitProc.on('error', (err) => {
       reject(new Error(`git archive error: ${err.message}`));
     });
-    
-    tarPath.stderr.on('data', (d) => { extractErr += d.toString(); });
-    tarPath.on('close', (code) => {
-      if (code === 0) {
-        resolve();
-      } else {
-        reject(new Error(`tar extract failed: ${extractErr.trim() || 'unknown error'}`));
+
+    gitProc.on('close', (code) => {
+      if (code !== 0) {
+        fs.rmSync(archivePath, { force: true });
+        reject(new Error(`git archive failed: ${gitErr.trim() || 'unknown error'}`));
+        return;
       }
-    });
-    tarPath.on('error', (err) => {
-      reject(new Error(`tar error: ${err.message}`));
+
+      const stripComponents = gitSubdir ? gitSubdir.split('/').filter(Boolean).length : 0;
+      const extractArgs = ['-xf', archivePath, '-C', targetDir];
+      if (stripComponents > 0) {
+        extractArgs.push(`--strip-components=${stripComponents}`);
+      }
+
+      const tarProc = spawn('tar', extractArgs, {
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+
+      let extractErr = '';
+      tarProc.stderr.on('data', (d) => { extractErr += d.toString(); });
+      tarProc.on('error', (err) => {
+        fs.rmSync(archivePath, { force: true });
+        reject(new Error(`tar error: ${err.message}`));
+      });
+
+      tarProc.on('close', (tarCode) => {
+        fs.rmSync(archivePath, { force: true });
+        if (tarCode === 0) {
+          resolve();
+        } else {
+          reject(new Error(`tar extract failed: ${extractErr.trim() || 'unknown error'}`));
+        }
+      });
     });
   });
 }
@@ -702,20 +713,20 @@ const DEV_OPS = {
     requiresStaging: true,
     run: async () => {
       const sentinelPath = path.join(STAGING_WORKDIR, '.push-in-progress');
-      const stagingTagPrefix = 'staging-deploy-';
+      const stagingSourceRef = 'staging';
       let sourceTag = '';
 
       fs.writeFileSync(sentinelPath, '');
       try {
-        sourceTag = String(requestBody.tag || '').trim();
-        if (sourceTag) {
-          console.log(`[push-to-staging] using requested tag ${sourceTag}`);
-        } else {
-          console.log(`[push-to-staging] resolving latest tag ${stagingTagPrefix}*`);
-          sourceTag = await resolveLatestTagByPrefix(stagingTagPrefix);
+        if (String(requestBody.tag || '').trim()) {
+          console.log('[push-to-staging] ignoring requested tag; using staging branch head');
         }
-        const commitSha = await resolveGitRef(sourceTag);
-        console.log(`[push-to-staging] selected tag ${sourceTag} → ${commitSha}`);
+
+        console.log(`[push-to-staging] resolving ${stagingSourceRef} branch head`);
+        const commitSha = await resolveGitRef(stagingSourceRef);
+        const deployDate = new Date().toISOString().slice(0, 10);
+        sourceTag = `staging-deploy-${deployDate}-${commitSha.slice(0, 7)}`;
+        console.log(`[push-to-staging] selected ${stagingSourceRef} → ${commitSha} (${sourceTag})`);
 
         const releaseDir = path.join(STAGING_RELEASES_ROOT, sourceTag);
         await clearDirectoryContents(releaseDir);

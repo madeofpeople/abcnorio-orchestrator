@@ -160,7 +160,7 @@ curl -X POST http://localhost:4011/restore \
 | `PREVIEW_BUILD_PATH` | (none) | Output path for preview builds |
 | `ASTRO_SITE_ROOT` | /astro-site | Astro source directory (mount) |
 | `ASTRO_BUILD_WORKDIR` | ASTRO_SITE_ROOT | Writable build scratch/work directory |
-| `ASTRO_STAGING_SITE_ROOT` | (none) | Staging source directory for push ops |
+| `ASTRO_STAGING_SITE_ROOT` | "" | Legacy compatibility knob; single-source runtime keeps staging generated from the same source tree |
 | `ASTRO_DEPLOYMENT_STATUS_FILE` | (none) | Override status file path |
 | `ORCHESTRATOR_SCRIPT_ROOT` | /orchestrator/scripts | Deploy script location |
 
