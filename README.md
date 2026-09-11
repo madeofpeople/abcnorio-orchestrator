@@ -57,7 +57,7 @@ deploy-orchestrator/
 #### **Staging Push Guardrails**
 - `POST /dev-tools/push-to-staging` exports approved tag into staging release dir, cuts over active staging tree, and prunes old releases.
 - During push, orchestrator enforces staging tree contract (`package.json`, `astro.config.mjs`, `src/pages/index.astro`).
-- Orchestrator performs deterministic dependency install in staging tree and verifies runtime deps resolve (`astro`, `shiki`) before reporting success.
+- Orchestrator performs deterministic dependency install in staging tree and verifies the runtime package resolves (`astro`) before reporting success.
 
 #### **http.mjs**
 - Auth token extraction from `Authorization: Bearer <token>`

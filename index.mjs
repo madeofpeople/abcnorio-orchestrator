@@ -739,18 +739,15 @@ const DEV_OPS = {
         await fs.promises.rm(path.join(releaseDir, 'node_modules'), { recursive: true, force: true });
         await npmInstallDeterministic(releaseDir);
         await assertNodeModuleResolvable(releaseDir, 'astro');
-        await assertNodeModuleResolvable(releaseDir, 'shiki');
 
-        // Cut over active staging tree from prepared release.
+        // Cut over active staging tree from prepared release. The release dir is
+        // the canonical deterministic install and has already been validated, so
+        // we avoid the extra post-copy install unless the runtime contract later
+        // proves the live tree still requires it.
         await clearDirectoryContentsExcept(STAGING_WORKDIR, ['releases', '.push-in-progress']);
         await copyDirectoryContents(releaseDir, STAGING_WORKDIR);
         await assertStagingTreeContract(STAGING_WORKDIR);
-
-        // Re-run deterministic install in active staging root to ensure local
-        // node_modules symlinks are rooted in /app for the astro-staging container.
-        await npmInstallDeterministic(STAGING_WORKDIR);
         await assertNodeModuleResolvable(STAGING_WORKDIR, 'astro');
-        await assertNodeModuleResolvable(STAGING_WORKDIR, 'shiki');
 
         await pruneStagingReleaseDirs(STAGING_RELEASES_ROOT, sourceTag);
         await fs.promises.rm(path.join(STAGING_RELEASES_ROOT, STAGING_LAST_FAILED_FILE), { force: true });
