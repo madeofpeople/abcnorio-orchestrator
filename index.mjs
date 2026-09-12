@@ -1179,6 +1179,24 @@ app.get('/dev-tools/database-backups/download', (c) => {
   }
 });
 
+app.post('/dev-tools/database-backups/delete', async (c) => {
+  let parsed;
+  try {
+    parsed = await c.req.json();
+  } catch {
+    return jsonError(c, 400, 'invalid_json', 'invalid json');
+  }
+
+  const file = String(parsed?.file || '').trim();
+  try {
+    const archivePath = resolveDatabaseBackupArchive(file);
+    fs.unlinkSync(archivePath);
+    return jsonOk(c, 200, { status: 'deleted', file });
+  } catch (error) {
+    return jsonError(c, 404, 'delete_failed', error instanceof Error ? error.message : 'unknown error');
+  }
+});
+
 app.get('/dev-tools/media-backups/download', (c) => {
   const target = String(c.req.query('target') || '').trim();
   const file = String(c.req.query('file') || '').trim();
