@@ -6,7 +6,7 @@ import { Hono } from 'hono';
 import { serve } from '@hono/node-server';
 import { z } from 'zod';
 import { enqueue, getQueueStatus } from './queue.mjs';
-import { devToolsState, startDevOp, copyMediaFiles, createMediaBackupArchive, dumpDatabase, uploads, db, assertUploadsContract } from './dev-tools.mjs';
+import { devToolsState, startDevOp, copyMediaFiles, createMediaBackupArchive, createDatabaseBackupArchive, listDatabaseBackups, resolveDatabaseBackupArchive, dumpDatabase, uploads, db, assertUploadsContract } from './dev-tools.mjs';
 import {
   listArchivesForTarget,
   runCommand,
@@ -687,6 +687,12 @@ const DEV_OPS = {
     label: 'backup-media-staging',
     run: () => createMediaBackupArchive(uploads.staging, 'staging').then((name) => `Staging media backup created: ${name}`),
   },
+  '/dev-tools/backup-database-staging': {
+    key: 'backupDatabaseStaging',
+    label: 'backup-database-staging',
+    requiresDb: true,
+    run: () => createDatabaseBackupArchive(db.staging).then((name) => `Staging database backup created: ${name}`),
+  },
   '/dev-tools/pull-from-dev': {
     key: 'pullDBFromDevToStaging',
     label: 'pull-from-dev',
@@ -1153,6 +1159,24 @@ app.get('/dev-tools/media-backups', (c) => {
     target,
     backups: listMediaBackups(target),
   });
+});
+
+app.get('/dev-tools/database-backups', (c) => jsonOk(c, 200, { backups: listDatabaseBackups() }));
+
+app.get('/dev-tools/database-backups/download', (c) => {
+  const file = String(c.req.query('file') || '').trim();
+
+  try {
+    const archivePath = resolveDatabaseBackupArchive(file);
+    const stat = fs.statSync(archivePath);
+    const stream = fs.createReadStream(archivePath);
+    c.header('Content-Type', 'application/sql');
+    c.header('Content-Disposition', `attachment; filename="${path.basename(archivePath)}"`);
+    c.header('Content-Length', String(stat.size));
+    return c.body(stream, 200);
+  } catch (error) {
+    return jsonError(c, 404, 'archive_not_found', error instanceof Error ? error.message : 'unknown error');
+  }
 });
 
 app.get('/dev-tools/media-backups/download', (c) => {

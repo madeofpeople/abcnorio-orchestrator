@@ -10,12 +10,16 @@ export const uploads = {
 const SHARED_UID = Number(process.env.PROJECT_UID || 1000);
 const SHARED_GID = Number(process.env.PROJECT_GID || 2000);
 const MAX_MEDIA_BACKUPS = Math.max(1, Number(process.env.MAX_MEDIA_BACKUPS || 2));
+const MAX_DATABASE_BACKUPS = Math.max(1, Number(process.env.MAX_DATABASE_BACKUPS || 2));
 const BASE_ARCHIVE_DIR = process.env.ASTRO_BUILD_ARCHIVE_DIR
   ? path.resolve(process.env.ASTRO_BUILD_ARCHIVE_DIR)
   : path.resolve(process.env.ASTRO_BUILD_WORKDIR || '/astro-build', 'build-archives');
 const MEDIA_ARCHIVE_DIR = process.env.ASTRO_BUILD_MEDIA_ARCHIVE_DIR
   ? path.resolve(process.env.ASTRO_BUILD_MEDIA_ARCHIVE_DIR)
   : path.resolve(BASE_ARCHIVE_DIR, 'media');
+const DATABASE_ARCHIVE_DIR = process.env.ASTRO_BUILD_DATABASE_ARCHIVE_DIR
+  ? path.resolve(process.env.ASTRO_BUILD_DATABASE_ARCHIVE_DIR)
+  : path.resolve(BASE_ARCHIVE_DIR, 'database');
 
 function assertUploadsPathContract(label, uploadsPath) {
   let stat;
@@ -84,6 +88,7 @@ export const devToolsState = {
   pullDBFromDevToStaging: idleDevToolState(),
   backupMediaDev: idleDevToolState(),
   backupMediaStaging: idleDevToolState(),
+  backupDatabaseStaging: idleDevToolState(),
 };
 
 function setDevToolState(key, status, started, message = null) {
@@ -180,6 +185,105 @@ export function createMediaBackupArchive(sourceDir, target) {
 
     zipProc.on('error', (error) => {
       reject(new Error(`zip process error: ${error.message}`));
+    });
+  });
+}
+
+function cleanupOldDatabaseBackups() {
+  if (!fs.existsSync(DATABASE_ARCHIVE_DIR)) return;
+
+  const backups = fs.readdirSync(DATABASE_ARCHIVE_DIR)
+    .filter((name) => name.startsWith('abcnorio-database-staging-') && name.endsWith('.sql'))
+    .map((name) => ({
+      name,
+      fullPath: path.join(DATABASE_ARCHIVE_DIR, name),
+      mtime: fs.statSync(path.join(DATABASE_ARCHIVE_DIR, name)).mtimeMs,
+    }))
+    .sort((a, b) => b.mtime - a.mtime);
+
+  for (const backup of backups.slice(MAX_DATABASE_BACKUPS)) {
+    try {
+      fs.unlinkSync(backup.fullPath);
+    } catch (error) {
+      console.warn(`[backup-database-staging] failed to delete old archive ${backup.name}: ${error.message}`);
+    }
+  }
+}
+
+export function listDatabaseBackups() {
+  if (!fs.existsSync(DATABASE_ARCHIVE_DIR)) return [];
+
+  return fs.readdirSync(DATABASE_ARCHIVE_DIR)
+    .filter((name) => name.startsWith('abcnorio-database-staging-') && name.endsWith('.sql'))
+    .map((name) => ({
+      name,
+      mtime: fs.statSync(path.join(DATABASE_ARCHIVE_DIR, name)).mtimeMs,
+    }))
+    .sort((a, b) => b.mtime - a.mtime)
+    .slice(0, MAX_DATABASE_BACKUPS);
+}
+
+export function resolveDatabaseBackupArchive(requestedName) {
+  const name = String(requestedName || '').trim();
+  if (!/^abcnorio-database-staging-[a-zA-Z0-9_-]+\.sql$/.test(name)) {
+    throw new Error('invalid archive');
+  }
+
+  const archivePath = path.resolve(DATABASE_ARCHIVE_DIR, name);
+  if (!archivePath.startsWith(`${DATABASE_ARCHIVE_DIR}${path.sep}`)) {
+    throw new Error('invalid archive');
+  }
+  if (!fs.existsSync(archivePath) || !fs.statSync(archivePath).isFile()) {
+    throw new Error('archive not found');
+  }
+
+  return archivePath;
+}
+
+export function createDatabaseBackupArchive(source) {
+  fs.mkdirSync(DATABASE_ARCHIVE_DIR, { recursive: true });
+
+  const timestamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15);
+  const archiveName = `abcnorio-database-staging-${timestamp}.sql`;
+  const archivePath = path.join(DATABASE_ARCHIVE_DIR, archiveName);
+  const tempPath = `${archivePath}.tmp`;
+
+  return new Promise((resolve, reject) => {
+    const dump = spawn('mysqldump', [
+      `--host=${source.host}`,
+      `--user=${source.user}`,
+      '--ssl=FALSE',
+      '--single-transaction',
+      '--no-tablespaces',
+      source.name,
+    ], { env: { ...process.env, MYSQL_PWD: source.password } });
+    const output = fs.createWriteStream(tempPath, { mode: 0o664 });
+    let stderr = '';
+
+    dump.stderr.on('data', (data) => { stderr += data.toString(); });
+    dump.stdout.pipe(output);
+    dump.on('close', (code) => {
+      if (code !== 0) {
+        output.destroy();
+        fs.rmSync(tempPath, { force: true });
+        reject(new Error(`mysqldump failed (${code}): ${stderr.trim()}`));
+      }
+    });
+    output.on('finish', () => {
+      if (!fs.existsSync(tempPath)) return;
+      fs.renameSync(tempPath, archivePath);
+      cleanupOldDatabaseBackups();
+      resolve(archiveName);
+    });
+    dump.on('error', (error) => {
+      output.destroy();
+      fs.rmSync(tempPath, { force: true });
+      reject(new Error(`mysqldump error: ${error.message}`));
+    });
+    output.on('error', (error) => {
+      dump.kill();
+      fs.rmSync(tempPath, { force: true });
+      reject(new Error(`database archive error: ${error.message}`));
     });
   });
 }
