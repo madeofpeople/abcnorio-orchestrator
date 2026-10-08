@@ -18,7 +18,8 @@ import {
 } from './files.mjs';
 import {
   loadStatus, saveStatus, markRequested, markStarted, markDone, markFailed, updateStatus,
-  setRuntimeState, getRuntimeState,
+  setRuntimeState, getRuntimeState, recordStagingDeployment, markStagingDeploymentVerified,
+  readWebcomponentsShaFromLock, assertInstalledWebcomponentsSha, assertStagingSourceSha,
 } from './status.mjs';
 
 const PORT = Number(process.env.ORCHESTRATOR_PORT || 4011);
@@ -31,6 +32,9 @@ const STAGING_FAILED_RELEASES_TO_KEEP = Number(process.env.STAGING_FAILED_RELEAS
 const SOURCE_ROOT = process.env.ASTRO_SITE_ROOT || '/astro-site';
 const SOURCE_GIT_ROOT = process.env.ASTRO_SITE_GIT_ROOT || SOURCE_ROOT;
 const SOURCE_GIT_SUBDIR = (process.env.ASTRO_SITE_GIT_SUBDIR || '').replace(/^\/+|\/+$/g, '');
+const STAGING_HEALTH_URL = String(process.env.STAGING_HEALTH_URL || '').trim();
+const STAGING_FRONTEND_HEALTH_URL = String(process.env.STAGING_FRONTEND_HEALTH_URL || '').trim();
+const STAGING_PLUGIN_VERSION_URL = String(process.env.STAGING_PLUGIN_VERSION_URL || '').trim();
 const WORKDIR = process.env.ASTRO_BUILD_WORKDIR || SOURCE_ROOT;
 const STAGING_WORKDIR = process.env.ASTRO_STAGING_SITE_ROOT || '';
 const STAGING_RELEASES_ROOT = process.env.ASTRO_STAGING_RELEASES_ROOT
@@ -47,6 +51,7 @@ const MEDIA_ARCHIVE_DIR = process.env.ASTRO_BUILD_MEDIA_ARCHIVE_DIR
   ? path.resolve(process.env.ASTRO_BUILD_MEDIA_ARCHIVE_DIR)
   : path.resolve(BASE_ARCHIVE_DIR, 'media');
 const STAGING_LAST_FAILED_FILE = '.last-failed-release';
+let productionWriteInProgress = false;
 
 function listMediaBackups(target) {
   if (!fs.existsSync(MEDIA_ARCHIVE_DIR)) {
@@ -206,19 +211,20 @@ async function pruneStagingReleaseDirs(releasesRoot, successfulTag) {
     failedTag = (await fs.promises.readFile(lastFailedPath, 'utf8')).trim();
   }
 
-  const stagingDeployTags = dirs.filter((name) => name.startsWith('staging-deploy-'));
+  const stagingReleaseDirs = dirs.filter((name) =>
+    name.startsWith('staging-release-') || name.startsWith('staging-deploy-'));
   const successful = [];
-  for (const tag of stagingDeployTags) {
-    if (failedTag && tag === failedTag) {
+  for (const releaseId of stagingReleaseDirs) {
+    if (failedTag && releaseId === failedTag) {
       continue;
     }
-    const fullPath = path.join(releasesRoot, tag);
+    const fullPath = path.join(releasesRoot, releaseId);
     const stat = await fs.promises.stat(fullPath);
-    successful.push({ tag, mtime: stat.mtimeMs });
+    successful.push({ releaseId, mtime: stat.mtimeMs });
   }
 
   successful.sort((a, b) => b.mtime - a.mtime);
-  const keepSuccessful = new Set(successful.slice(0, STAGING_SUCCESS_RELEASES_TO_KEEP).map((item) => item.tag));
+  const keepSuccessful = new Set(successful.slice(0, STAGING_SUCCESS_RELEASES_TO_KEEP).map((item) => item.releaseId));
   if (successfulTag) {
     keepSuccessful.add(successfulTag);
   }
@@ -228,19 +234,19 @@ async function pruneStagingReleaseDirs(releasesRoot, successfulTag) {
     failedToKeep.add(failedTag);
   }
 
-  for (const tag of stagingDeployTags) {
-    if (keepSuccessful.has(tag) || failedToKeep.has(tag)) {
+  for (const releaseId of stagingReleaseDirs) {
+    if (keepSuccessful.has(releaseId) || failedToKeep.has(releaseId)) {
       continue;
     }
-    await fs.promises.rm(path.join(releasesRoot, tag), { recursive: true, force: true });
+    await fs.promises.rm(path.join(releasesRoot, releaseId), { recursive: true, force: true });
   }
 }
 
 // Resolve git ref (branch, tag, or commit-ish) to commit SHA in SOURCE_GIT_ROOT.
-async function resolveGitRef(ref) {
+async function resolveGitRef(ref, repositoryRoot = SOURCE_GIT_ROOT) {
   return new Promise((resolve, reject) => {
     const proc = spawn('git', ['rev-parse', '--verify', `${ref}^{commit}`], {
-      cwd: SOURCE_GIT_ROOT,
+      cwd: repositoryRoot,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let stdout = '';
@@ -525,12 +531,18 @@ function assertStagingWebcomponentsContract(stagingRoot) {
     throw new Error(`staging contract violation: abcnorio-webcomponents must be git-pinned (github:*#ref), got "${currentDep || '(empty)'}"`);
   }
 
-  const lockText = fs.readFileSync(packageLockPath, 'utf8');
-  if (lockText.includes('"file:../../abcnorio-webcomponents"')) {
+  if (currentDep.includes('file:')) {
     throw new Error('staging lockfile contract violation: contains file:../../abcnorio-webcomponents');
   }
-  if (lockText.includes('"../../abcnorio-webcomponents"')) {
-    throw new Error('staging lockfile contract violation: contains local ../../abcnorio-webcomponents entry');
+
+  return readWebcomponentsShaFromLock(packageLockPath);
+}
+
+function assertStagingInputs(stagingRoot, expected) {
+  assertStagingSourceSha(stagingRoot, expected.sourceCommitSha);
+  const installedWebcomponentsSha = assertInstalledWebcomponentsSha(stagingRoot);
+  if (installedWebcomponentsSha !== expected.webcomponentsCommitSha) {
+    throw new Error('staging installed webcomponents SHA does not match recorded deployment');
   }
 }
 
@@ -592,6 +604,43 @@ async function checksumFileSha256(filePath) {
   });
 }
 
+async function readStagingPluginVersion() {
+  if (!STAGING_PLUGIN_VERSION_URL) {
+    throw new Error('STAGING_PLUGIN_VERSION_URL is required');
+  }
+
+  const response = await fetch(STAGING_PLUGIN_VERSION_URL, { signal: AbortSignal.timeout(5000) });
+  if (!response.ok) {
+    throw new Error(`staging plugin version endpoint returned HTTP ${response.status}`);
+  }
+
+  const body = await response.json();
+  const version = String(body?.version || '').trim();
+  if (!/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(version)) {
+    throw new Error('staging plugin version endpoint returned an invalid version');
+  }
+
+  return version;
+}
+
+async function finishProductionDeploy(syncStagingUploads = false) {
+  const productionUploadsPath = String(process.env.PRODUCTION_UPLOADS_PATH || '').trim();
+  if (syncStagingUploads && productionUploadsPath && fs.existsSync(uploads.staging)) {
+    await fs.promises.mkdir(productionUploadsPath, { recursive: true });
+    await fs.promises.cp(uploads.staging, productionUploadsPath, {
+      recursive: true,
+      force: false,
+      errorOnExist: false,
+    });
+  }
+
+  const warmCacheScript = path.join(SCRIPT_ROOT, 'warm-cache.sh');
+  const warmCacheExitCode = await runCommand('bash', [warmCacheScript], process.env);
+  if (warmCacheExitCode !== 0) {
+    console.warn(`[production] cache warm failed with exit ${warmCacheExitCode}`);
+  }
+}
+
 function getTargetEnvStatus(target) {
   const status = loadStatus();
   const envStatus = status?.envs?.[target];
@@ -621,7 +670,7 @@ function resolveRollbackReleaseId(target) {
   return String(releases[1].releaseId || '').trim();
 }
 
-async function deployReleaseArtifact(target, deployBuildPath, archivePath, sourceCommitSha = null) {
+async function deployReleaseArtifact(target, deployBuildPath, archivePath, sourceCommitSha = null, syncStagingUploads = false) {
   const resolvedArchivePath = path.resolve(archivePath);
   const releaseId = extractReleaseIdFromArchiveName(target, path.basename(resolvedArchivePath));
   const checksumSha256 = await checksumFileSha256(resolvedArchivePath);
@@ -649,6 +698,10 @@ async function deployReleaseArtifact(target, deployBuildPath, archivePath, sourc
       .map((c) => c.name)
       .join(', ');
     throw new Error(`smoke checks failed after deploy release_id=${releaseId}: ${failedNames}`);
+  }
+
+  if (target === 'production') {
+    await finishProductionDeploy(syncStagingUploads);
   }
 
   return {
@@ -713,38 +766,43 @@ const DEV_OPS = {
       return 'Staging data pulled to dev.';
     },
   },
-  '/dev-tools/push-to-staging': (requestBody = {}) => ({
+  '/dev-tools/push-to-staging': () => ({
     key: 'push',
     label: 'push-to-staging',
     requiresStaging: true,
     run: async () => {
       const sentinelPath = path.join(STAGING_WORKDIR, '.push-in-progress');
       const stagingSourceRef = 'staging';
-      let sourceTag = '';
+      let sourceReleaseId = '';
+      let stagingPluginVersion = '';
 
       fs.writeFileSync(sentinelPath, '');
       try {
-        if (String(requestBody.tag || '').trim()) {
-          console.log('[push-to-staging] ignoring requested tag; using staging branch head');
-        }
-
         console.log(`[push-to-staging] resolving ${stagingSourceRef} branch head`);
         const commitSha = await resolveGitRef(stagingSourceRef);
+        stagingPluginVersion = await readStagingPluginVersion();
         const deployDate = new Date().toISOString().slice(0, 10);
-        sourceTag = `staging-deploy-${deployDate}-${commitSha.slice(0, 7)}`;
-        console.log(`[push-to-staging] selected ${stagingSourceRef} → ${commitSha} (${sourceTag})`);
+        sourceReleaseId = `staging-release-${deployDate}-${commitSha.slice(0, 7)}`;
+        console.log(`[push-to-staging] selected ${stagingSourceRef} → ${commitSha} (${sourceReleaseId})`);
 
-        const releaseDir = path.join(STAGING_RELEASES_ROOT, sourceTag);
+        const releaseDir = path.join(STAGING_RELEASES_ROOT, sourceReleaseId);
         await clearDirectoryContents(releaseDir);
         console.log(`[push-to-staging] exporting commit ${commitSha} to release ${releaseDir}`);
         await exportGitCommit(commitSha, releaseDir, SOURCE_GIT_SUBDIR);
 
         await assertStagingTreeContract(releaseDir);
-        assertStagingWebcomponentsContract(releaseDir);
+        const webcomponentsCommitSha = assertStagingWebcomponentsContract(releaseDir);
 
         await fs.promises.rm(path.join(releaseDir, 'node_modules'), { recursive: true, force: true });
         await npmInstallDeterministic(releaseDir);
         await assertNodeModuleResolvable(releaseDir, 'astro');
+        const installedWebcomponentsSha = assertInstalledWebcomponentsSha(releaseDir);
+        if (installedWebcomponentsSha !== webcomponentsCommitSha) {
+          throw new Error(`installed webcomponents SHA ${installedWebcomponentsSha} does not match package-lock SHA ${webcomponentsCommitSha}`);
+        }
+        fs.writeFileSync(path.join(releaseDir, '.staging-provenance.json'), `${JSON.stringify({
+          sourceCommitSha: commitSha,
+        })}\n`);
 
         // Cut over active staging tree from prepared release. The release dir is
         // the canonical deterministic install and has already been validated, so
@@ -754,16 +812,25 @@ const DEV_OPS = {
         await copyDirectoryContents(releaseDir, STAGING_WORKDIR);
         await assertStagingTreeContract(STAGING_WORKDIR);
         await assertNodeModuleResolvable(STAGING_WORKDIR, 'astro');
+        const activeWebcomponentsSha = assertInstalledWebcomponentsSha(STAGING_WORKDIR);
+        if (activeWebcomponentsSha !== webcomponentsCommitSha) {
+          throw new Error(`active staging workdir webcomponents SHA ${activeWebcomponentsSha} does not match candidate SHA ${webcomponentsCommitSha}`);
+        }
+        const livePluginVersion = await readStagingPluginVersion();
+        if (livePluginVersion !== stagingPluginVersion) {
+          throw new Error(`staging plugin changed during cutover (before ${stagingPluginVersion}, after ${livePluginVersion})`);
+        }
+        recordStagingDeployment(commitSha, webcomponentsCommitSha, sourceReleaseId, stagingPluginVersion);
 
-        await pruneStagingReleaseDirs(STAGING_RELEASES_ROOT, sourceTag);
+        await pruneStagingReleaseDirs(STAGING_RELEASES_ROOT, sourceReleaseId);
         await fs.promises.rm(path.join(STAGING_RELEASES_ROOT, STAGING_LAST_FAILED_FILE), { force: true });
 
-        return `Code pushed to staging from tag ${sourceTag} at ${commitSha}.`;
+        return `Staging release ${sourceReleaseId} prepared for commit ${commitSha} with webcomponents ${webcomponentsCommitSha} and plugin ${stagingPluginVersion}.`;
       } catch (error) {
         try {
-          if (sourceTag) {
+          if (sourceReleaseId) {
             await fs.promises.mkdir(STAGING_RELEASES_ROOT, { recursive: true });
-            await fs.promises.writeFile(path.join(STAGING_RELEASES_ROOT, STAGING_LAST_FAILED_FILE), `${sourceTag}\n`, 'utf8');
+            await fs.promises.writeFile(path.join(STAGING_RELEASES_ROOT, STAGING_LAST_FAILED_FILE), `${sourceReleaseId}\n`, 'utf8');
           }
         } catch (markerError) {
           console.warn(`[push-to-staging] failed to persist last-failed marker: ${markerError instanceof Error ? markerError.message : String(markerError)}`);
@@ -872,12 +939,24 @@ function normalizeScope(scope) {
   throw new Error(`invalid scope: ${scope}`);
 }
 
-async function buildJob(target, scope) {
+function failBuildJob(target, startedAt, message, exitCode = 1) {
+  setRuntimeState({
+    status: 'failed',
+    target,
+    started: startedAt,
+    finished: Date.now(),
+    exitCode,
+    message,
+  });
+  markFailed(target, message);
+}
+
+async function buildJob(target, scope, requestedCommitSha = '', promotionState = null) {
   console.log(`[worker] starting job for target=${target} scope=${scope}`);
 
   const deployBuildPath = TARGETS[target];
   const resolvedDeployPath = assertDeployPath(target, deployBuildPath);
-  const sourceCommitSha = await resolveGitRef('HEAD');
+  const sourceCommitSha = await resolveGitRef(requestedCommitSha || 'HEAD');
 
   const startedAt = Date.now();
   setRuntimeState({
@@ -890,29 +969,63 @@ async function buildJob(target, scope) {
   });
   markStarted(target);
 
-  await prepareBuildWorkdir(SOURCE_ROOT, WORKDIR);
+  if (requestedCommitSha) {
+    await clearDirectoryContents(WORKDIR);
+    await exportGitCommit(sourceCommitSha, WORKDIR, SOURCE_GIT_SUBDIR);
+  } else {
+    await prepareBuildWorkdir(SOURCE_ROOT, WORKDIR);
+  }
+
+  if (promotionState) {
+    try {
+      const lockedWebcomponentsSha = readWebcomponentsShaFromLock(path.join(WORKDIR, 'package-lock.json'));
+      if (lockedWebcomponentsSha !== promotionState.webcomponentsCommitSha) {
+        throw new Error(`production candidate lock pins webcomponents ${lockedWebcomponentsSha}, tested Staging pins ${promotionState.webcomponentsCommitSha}`);
+      }
+    } catch (error) {
+      const message = `production candidate does not match tested Staging inputs: ${error instanceof Error ? error.message : String(error)}`;
+      failBuildJob(target, startedAt, message);
+      throw new Error(message);
+    }
+  }
 
   console.log(`[worker] ${target} executing ${DEPLOY_SCRIPT}`);
   const archiveBefore = new Set(listArchivesForTarget(target));
-  const exitCode = await runCommand('bash', [DEPLOY_SCRIPT, target, scope], {
+  const commandEnv = {
     ...process.env,
     SOURCE_COMMIT_SHA: sourceCommitSha,
-  });
+  };
+  if (promotionState) {
+    commandEnv.ASTRO_DESIGN_TOKENS_DIR = path.join(
+      WORKDIR,
+      'node_modules/abcnorio-webcomponents/src/design-tokens',
+    );
+  }
+  const exitCode = await runCommand('bash', [DEPLOY_SCRIPT, target, scope], commandEnv);
   console.log(`[worker] ${target} script exited with code ${exitCode}`);
 
   if (exitCode !== 0) {
     const message = `script failed with exit ${exitCode}`;
-    setRuntimeState({
-      status: 'failed',
-      target,
-      started: startedAt,
-      finished: Date.now(),
-      exitCode,
-      message,
-    });
-    markFailed(target, message);
+    failBuildJob(target, startedAt, message, exitCode);
     console.log(`[worker] ${target} script failed: ${message}`);
     throw new Error(message);
+  }
+
+  if (promotionState) {
+    const installedWebcomponentsSha = assertInstalledWebcomponentsSha(WORKDIR);
+    if (installedWebcomponentsSha !== promotionState.webcomponentsCommitSha) {
+      const message = `production installed webcomponents ${installedWebcomponentsSha} differs from tested Staging ${promotionState.webcomponentsCommitSha}`;
+      failBuildJob(target, startedAt, message);
+      throw new Error(message);
+    }
+
+    const livePluginVersion = await readStagingPluginVersion();
+    if (livePluginVersion !== promotionState.pluginVersion) {
+      const message = `staging plugin changed during production build (tested ${promotionState.pluginVersion}, live ${livePluginVersion}); production was not updated`;
+      failBuildJob(target, startedAt, message);
+      throw new Error(message);
+    }
+
   }
 
   const archiveAfter = listArchivesForTarget(target);
@@ -920,6 +1033,7 @@ async function buildJob(target, scope) {
   if (!createdArchive) {
     const message = `backup contract violation: no new archive created for target=${target}`;
     console.warn(`[worker] ${message}`);
+    failBuildJob(target, startedAt, message);
     throw new Error(message);
   }
 
@@ -934,8 +1048,32 @@ async function buildJob(target, scope) {
     releaseId,
     checksumSha256,
   });
-  const deployedRelease = await deployReleaseArtifact(target, resolvedDeployPath, archivePath, sourceCommitSha);
+  let deployedRelease;
+  try {
+    deployedRelease = await deployReleaseArtifact(
+      target,
+      resolvedDeployPath,
+      archivePath,
+      sourceCommitSha,
+      target === 'production' && requestedCommitSha !== '',
+    );
+  } catch (error) {
+    const message = `${target} release ${releaseId} deployment failed: ${error instanceof Error ? error.message : String(error)}`;
+    failBuildJob(target, startedAt, message);
+    throw error;
+  }
   console.log(`[worker] ${target} deployed release_id=${deployedRelease.releaseId || 'unknown'} checksum=${deployedRelease.checksumSha256}`);
+  if (target === 'production') {
+    try {
+      const tagName = await tagProductionDeploy(sourceCommitSha, Date.now());
+      console.log(`[worker] production deploy tagged: ${tagName} @ ${sourceCommitSha}`);
+    } catch (error) {
+      const message = `production deployed release ${deployedRelease.releaseId}, but tagging failed: ${error instanceof Error ? error.message : String(error)}`;
+      failBuildJob(target, startedAt, message);
+      throw error;
+    }
+  }
+
   setRuntimeState({
     status: 'done',
     target,
@@ -946,17 +1084,20 @@ async function buildJob(target, scope) {
   });
   markDone(target);
 
-  if (target === 'production') {
-    const tagName = await tagProductionDeploy(sourceCommitSha, Date.now());
-    console.log(`[worker] production deploy tagged: ${tagName} @ ${sourceCommitSha}`);
-  }
-
   console.log(`[worker] ${target} deployment completed successfully`);
 }
 
-function enqueueTarget(target, source = 'manual', scope = 'full') {
+function enqueueTarget(target, source = 'manual', scope = 'full', sourceCommitSha = '', promotionState = null) {
   const normalizedScope = normalizeScope(scope);
-  const result = enqueue(target, source, normalizedScope, (t, _s, sc) => buildJob(t, sc));
+  const result = enqueue(target, source, normalizedScope, async (t, _s, sc) => {
+    try {
+      await buildJob(t, sc, sourceCommitSha, promotionState);
+    } finally {
+      if (source === 'staging-promotion') {
+        productionWriteInProgress = false;
+      }
+    }
+  });
   if (result.accepted) {
     console.log(`[enqueue] trigger accepted for ${target} (source=${source}, scope=${normalizedScope})`);
     markRequested(target);
@@ -986,10 +1127,6 @@ const RollbackBodySchema = z.object({
 const MediaDeleteBodySchema = z.object({
   target: z.string().trim().min(1),
   file: z.string().trim().min(1),
-});
-
-const DevToolsPushBodySchema = z.object({
-  tag: z.string().trim().optional(),
 });
 
 function jsonOk(c, code, data = {}) {
@@ -1062,19 +1199,168 @@ app.post('/trigger', async (c) => {
   if (!isKnownDeployTarget(target)) {
     return jsonError(c, 400, 'invalid_target', 'invalid target', { valid: Object.keys(TARGETS) });
   }
+  if (target === 'production') {
+    return jsonError(c, 403, 'production_requires_staging_promotion', 'production builds must promote the commit currently deployed to healthy staging');
+  }
   if (source === 'manual' && !ALLOW_MANUAL_TRIGGER) {
     return jsonError(c, 403, 'manual_trigger_disabled', 'manual trigger is disabled');
   }
-  if (source === 'save' && target === 'production') {
-    return jsonError(c, 403, 'production_save_trigger_disabled', 'production save-trigger is disabled');
-  }
-
   const result = enqueueTarget(target, source, scope);
   if (!result.accepted) {
     return jsonError(c, 409, 'build_already_queued', 'build already queued');
   }
 
   return jsonOk(c, 202, { status: 'queued', target, source, scope });
+});
+
+app.post('/promote-staging', async (c) => {
+  if (productionWriteInProgress) {
+    return jsonError(c, 409, 'production_operation_running', 'a production deploy or restore is already running');
+  }
+
+  const stagingDeployment = getTargetEnvStatus('staging').stagingDeployment;
+  const sourceCommitSha = String(stagingDeployment?.sourceCommitSha || '').trim();
+  const stagedWebcomponentsSha = String(stagingDeployment?.webcomponentsCommitSha || '').trim();
+  const stagingReleaseId = String(stagingDeployment?.releaseId || '').trim();
+  const recordedPluginVersion = String(stagingDeployment?.pluginVersion || '').trim();
+  const verifiedAt = String(stagingDeployment?.verifiedAt || '').trim();
+
+  if (!/^[a-f0-9]{40}$/i.test(sourceCommitSha)) {
+    return jsonError(c, 409, 'staging_commit_unavailable', 'no valid full commit SHA is recorded for the staging deployment');
+  }
+
+  if (!recordedPluginVersion) {
+    return jsonError(c, 409, 'staging_plugin_version_unavailable', 'no staging plugin version is recorded for the tested staging deployment');
+  }
+  if (!/^[a-f0-9]{40}$/i.test(stagedWebcomponentsSha)) {
+    return jsonError(c, 409, 'staging_webcomponents_sha_unavailable', 'no valid webcomponents SHA is recorded for the staging deployment');
+  }
+  if (!verifiedAt) {
+    return jsonError(c, 409, 'staging_not_verified', 'staging candidate has not been activated and verified');
+  }
+  if (devToolsState.push.status === 'running') {
+    return jsonError(c, 409, 'staging_cutover_running', 'staging deployment is in progress');
+  }
+
+  const healthChecks = [
+    ['CMS', STAGING_HEALTH_URL],
+    ['frontend', STAGING_FRONTEND_HEALTH_URL],
+  ];
+  for (const [label, url] of healthChecks) {
+    if (!url) {
+      return jsonError(c, 503, 'staging_health_url_missing', `staging ${label} health URL is required for production promotion`);
+    }
+    try {
+      const response = await fetch(url, { signal: AbortSignal.timeout(5000) });
+      if (!response.ok) {
+        return jsonError(c, 409, 'staging_unhealthy', `staging ${label} health probe returned HTTP ${response.status}`);
+      }
+    } catch (error) {
+      return jsonError(c, 409, 'staging_unhealthy', `staging ${label} health probe failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  try {
+    const resolvedSha = await resolveGitRef(sourceCommitSha);
+    if (resolvedSha !== sourceCommitSha) {
+      return jsonError(c, 409, 'staging_commit_mismatch', 'recorded staging SHA did not resolve to the same commit');
+    }
+
+    assertStagingInputs(STAGING_WORKDIR, stagingDeployment);
+    const livePluginVersion = await readStagingPluginVersion();
+    if (livePluginVersion !== recordedPluginVersion) {
+      return jsonError(c, 409, 'staging_plugin_version_changed', `staging plugin changed since frontend verification (recorded ${recordedPluginVersion}, live ${livePluginVersion}); deploy and verify staging again`);
+    }
+
+    const latestStagingDeployment = getTargetEnvStatus('staging').stagingDeployment;
+    if (latestStagingDeployment?.sourceCommitSha !== sourceCommitSha
+      || latestStagingDeployment?.webcomponentsCommitSha !== stagedWebcomponentsSha
+      || latestStagingDeployment?.pluginVersion !== recordedPluginVersion
+      || latestStagingDeployment?.verifiedAt !== verifiedAt
+      || devToolsState.push.status === 'running') {
+      return jsonError(c, 409, 'staging_changed_during_promotion_check', 'staging changed while promotion was being validated; retry after staging is stable');
+    }
+
+    if (productionWriteInProgress) {
+      return jsonError(c, 409, 'production_operation_running', 'a production deploy or restore is already running');
+    }
+    productionWriteInProgress = true;
+    const result = enqueueTarget('production', 'staging-promotion', 'full', sourceCommitSha, {
+      pluginVersion: recordedPluginVersion,
+      webcomponentsCommitSha: stagedWebcomponentsSha,
+    });
+    if (!result.accepted) {
+      productionWriteInProgress = false;
+      return jsonError(c, 409, 'build_already_queued', 'a build or promotion is already queued');
+    }
+
+    return jsonOk(c, 202, {
+      status: 'queued',
+      target: 'production',
+      source: 'staging-promotion',
+      source_commit_sha: sourceCommitSha,
+      staging_release_id: stagingReleaseId,
+      staging_plugin_version: livePluginVersion,
+      webcomponents_commit_sha: stagedWebcomponentsSha,
+    });
+  } catch (error) {
+    productionWriteInProgress = false;
+    return jsonError(c, 409, 'staging_commit_unavailable', error instanceof Error ? error.message : String(error));
+  }
+});
+
+app.post('/dev-tools/verify-staging', async (c) => {
+  if (devToolsState.push.status === 'running') {
+    return jsonError(c, 409, 'staging_cutover_running', 'cannot verify staging while cutover is running');
+  }
+
+  const stagingDeployment = getTargetEnvStatus('staging').stagingDeployment;
+  const sourceCommitSha = String(stagingDeployment?.sourceCommitSha || '').trim();
+  const webcomponentsCommitSha = String(stagingDeployment?.webcomponentsCommitSha || '').trim();
+  const releaseId = String(stagingDeployment?.releaseId || '').trim();
+  const pluginVersion = String(stagingDeployment?.pluginVersion || '').trim();
+
+  if (!sourceCommitSha || !webcomponentsCommitSha || !releaseId || !pluginVersion) {
+    return jsonError(c, 409, 'staging_candidate_unavailable', 'no complete prepared staging candidate is recorded');
+  }
+
+  try {
+    assertStagingInputs(STAGING_WORKDIR, stagingDeployment);
+    const livePluginVersion = await readStagingPluginVersion();
+    if (livePluginVersion !== pluginVersion) {
+      return jsonError(c, 409, 'staging_plugin_version_changed', `staging plugin version changed (prepared ${pluginVersion}, live ${livePluginVersion})`);
+    }
+
+    for (const [label, url] of [['CMS', STAGING_HEALTH_URL], ['frontend', STAGING_FRONTEND_HEALTH_URL]]) {
+      if (!url) {
+        return jsonError(c, 503, 'staging_health_url_missing', `staging ${label} health URL is required`);
+      }
+      const response = await fetch(url, { signal: AbortSignal.timeout(5000) });
+      if (!response.ok) {
+        return jsonError(c, 409, 'staging_unhealthy', `staging ${label} health probe returned HTTP ${response.status}`);
+      }
+    }
+
+    const latestStagingDeployment = getTargetEnvStatus('staging').stagingDeployment;
+    if (devToolsState.push.status === 'running'
+      || latestStagingDeployment?.sourceCommitSha !== sourceCommitSha
+      || latestStagingDeployment?.webcomponentsCommitSha !== webcomponentsCommitSha
+      || latestStagingDeployment?.releaseId !== releaseId
+      || latestStagingDeployment?.pluginVersion !== pluginVersion) {
+      return jsonError(c, 409, 'staging_changed_during_verification', 'staging candidate changed during verification; retry after cutover is stable');
+    }
+
+    markStagingDeploymentVerified(releaseId, sourceCommitSha, webcomponentsCommitSha, pluginVersion);
+    return jsonOk(c, 200, {
+      status: 'verified',
+      source_commit_sha: sourceCommitSha,
+      webcomponents_commit_sha: webcomponentsCommitSha,
+      plugin_version: pluginVersion,
+      release_id: releaseId,
+    });
+  } catch (error) {
+    return jsonError(c, 409, 'staging_verification_failed', error instanceof Error ? error.message : String(error));
+  }
 });
 
 app.post('/restore', async (c) => {
@@ -1091,7 +1377,11 @@ app.post('/restore', async (c) => {
   if (!releaseId) {
     return jsonError(c, 400, 'missing_release_id', 'release_id is required');
   }
+  if (target === 'production' && productionWriteInProgress) {
+    return jsonError(c, 409, 'production_operation_running', 'a production deploy or restore is already running');
+  }
 
+  if (target === 'production') productionWriteInProgress = true;
   try {
     const archivePath = resolveArchiveForTargetByReleaseId(target, releaseId);
     const deployment = await deployArchiveForTarget(target, archivePath);
@@ -1104,6 +1394,8 @@ app.post('/restore', async (c) => {
     });
   } catch (error) {
     return jsonError(c, 400, 'restore_failed', error instanceof Error ? error.message : 'unknown error');
+  } finally {
+    if (target === 'production') productionWriteInProgress = false;
   }
 });
 
@@ -1118,7 +1410,11 @@ app.post('/rollback', async (c) => {
   if (!isKnownDeployTarget(target)) {
     return jsonError(c, 400, 'invalid_target', 'invalid target', { valid: Object.keys(TARGETS) });
   }
+  if (target === 'production' && productionWriteInProgress) {
+    return jsonError(c, 409, 'production_operation_running', 'a production deploy or rollback is already running');
+  }
 
+  if (target === 'production') productionWriteInProgress = true;
   try {
     const selectedReleaseId = releaseId || resolveRollbackReleaseId(target);
     const archivePath = resolveArchiveForTargetByReleaseId(target, selectedReleaseId);
@@ -1131,6 +1427,8 @@ app.post('/rollback', async (c) => {
     });
   } catch (error) {
     return jsonError(c, 400, 'rollback_failed', error instanceof Error ? error.message : 'unknown error');
+  } finally {
+    if (target === 'production') productionWriteInProgress = false;
   }
 });
 
@@ -1239,12 +1537,11 @@ app.post('/dev-tools/media-backups/delete', async (c) => {
 });
 
 app.post('/dev-tools/push-to-staging', async (c) => {
-  const parsed = await parseBody(c, DevToolsPushBodySchema);
-  if (!parsed.ok) {
-    return parsed.response;
+  if (productionWriteInProgress) {
+    return jsonError(c, 409, 'production_promotion_running', 'cannot change staging while production promotion is running');
   }
 
-  const op = DEV_OPS['/dev-tools/push-to-staging'](parsed.data);
+  const op = DEV_OPS['/dev-tools/push-to-staging']();
   if (op.requiresStaging && !STAGING_WORKDIR) {
     return jsonError(c, 500, 'staging_root_missing', 'ASTRO_STAGING_SITE_ROOT is not configured');
   }

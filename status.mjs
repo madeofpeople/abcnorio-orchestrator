@@ -10,6 +10,49 @@ const STATUS_FILE = process.env.ASTRO_DEPLOYMENT_STATUS_FILE
   ? path.resolve(process.env.ASTRO_DEPLOYMENT_STATUS_FILE)
   : path.resolve(ARCHIVE_DIR, 'deployment-status.json');
 const ENV_KEYS = ['dev', 'staging', 'production', 'preview'];
+const WEBCOMPONENTS_LOCK_KEY = 'node_modules/abcnorio-webcomponents';
+const WEBCOMPONENTS_GIT_PREFIX = 'git+ssh://git@github.com/madeofpeople/abcnorio-webcomponents.git#';
+
+function readWebcomponentsLockEntry(lockPath) {
+  const lock = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+  const entry = lock.packages?.[WEBCOMPONENTS_LOCK_KEY];
+  const resolved = String(entry?.resolved || '');
+  if (!resolved.startsWith(WEBCOMPONENTS_GIT_PREFIX)) {
+    throw new Error(`webcomponents lock entry is not pinned to the expected Git repository: ${lockPath}`);
+  }
+
+  const sha = resolved.slice(WEBCOMPONENTS_GIT_PREFIX.length);
+  if (!/^[a-f0-9]{40}$/i.test(sha)) {
+    throw new Error(`webcomponents lock entry must resolve to a full commit SHA: ${lockPath}`);
+  }
+
+  return sha.toLowerCase();
+}
+
+export function readWebcomponentsShaFromLock(lockPath) {
+  return readWebcomponentsLockEntry(lockPath);
+}
+
+export function assertInstalledWebcomponentsSha(siteRoot) {
+  const packageLockPath = path.join(siteRoot, 'package-lock.json');
+  const installedLockPath = path.join(siteRoot, 'node_modules/.package-lock.json');
+  const expectedSha = readWebcomponentsLockEntry(packageLockPath);
+  const installedSha = readWebcomponentsLockEntry(installedLockPath);
+
+  if (installedSha !== expectedSha) {
+    throw new Error('installed webcomponents package does not match package-lock.json');
+  }
+
+  return expectedSha;
+}
+
+export function assertStagingSourceSha(siteRoot, expectedSha) {
+  const markerPath = path.join(siteRoot, '.staging-provenance.json');
+  const marker = JSON.parse(fs.readFileSync(markerPath, 'utf8'));
+  if (marker.sourceCommitSha !== expectedSha) {
+    throw new Error('staging source SHA does not match deployment record');
+  }
+}
 
 function defaultRuntimeState() {
   return {
@@ -38,6 +81,15 @@ function defaultEnvStatus() {
     },
     latestBackup: null,
     latestReleaseId: null,
+    stagingDeployment: {
+      sourceCommitSha: '',
+      webcomponentsCommitSha: '',
+      releaseId: '',
+      pluginVersion: '',
+      preparedAt: null,
+      verifiedAt: null,
+      deployedAt: null,
+    },
     backups: [],
     lastSmoke: null,
     releases: [],
@@ -73,6 +125,12 @@ function normalizeStatus(input) {
     status.envs[env] = {
       ...defaults,
       ...envStatus,
+      stagingDeployment: {
+        ...defaults.stagingDeployment,
+        ...(envStatus.stagingDeployment && typeof envStatus.stagingDeployment === 'object'
+          ? envStatus.stagingDeployment
+          : {}),
+      },
       currentBuild: {
         ...defaults.currentBuild,
         ...currentBuild,
@@ -142,6 +200,49 @@ export function markFailed(target, message) {
     env.lastFinishedAt = new Date().toISOString();
     env.lastStatus = 'failed';
     env.lastError = message || 'job failed';
+  });
+}
+
+export function recordStagingDeployment(sourceCommitSha, webcomponentsCommitSha, releaseId, pluginVersion) {
+  const sha = String(sourceCommitSha || '').trim();
+  if (!/^[a-f0-9]{40}$/i.test(sha)) {
+    throw new Error('staging deployment requires a full 40-character commit SHA');
+  }
+  const webcomponentsSha = String(webcomponentsCommitSha || '').trim();
+  if (!/^[a-f0-9]{40}$/i.test(webcomponentsSha)) {
+    throw new Error('staging deployment requires a full webcomponents commit SHA');
+  }
+  const version = String(pluginVersion || '').trim();
+  if (!/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(version)) {
+    throw new Error('staging deployment requires a valid plugin version');
+  }
+
+  updateEnv('staging', (env) => {
+    env.stagingDeployment = {
+      sourceCommitSha: sha.toLowerCase(),
+      webcomponentsCommitSha: webcomponentsSha.toLowerCase(),
+      releaseId: String(releaseId || '').trim(),
+      pluginVersion: version,
+      preparedAt: new Date().toISOString(),
+      verifiedAt: null,
+      deployedAt: null,
+    };
+  });
+}
+
+export function markStagingDeploymentVerified(releaseId, sourceCommitSha, webcomponentsCommitSha, pluginVersion) {
+  updateEnv('staging', (env) => {
+    const deployment = env.stagingDeployment;
+    if (deployment.releaseId !== releaseId
+      || deployment.sourceCommitSha !== sourceCommitSha
+      || deployment.webcomponentsCommitSha !== webcomponentsCommitSha
+      || deployment.pluginVersion !== pluginVersion) {
+      throw new Error('staging verification does not match the prepared deployment');
+    }
+
+    const verifiedAt = new Date().toISOString();
+    deployment.verifiedAt = verifiedAt;
+    deployment.deployedAt = verifiedAt;
   });
 }
 

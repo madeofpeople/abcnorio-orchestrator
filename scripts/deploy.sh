@@ -3,8 +3,18 @@ set -e
 
 umask 0002
 
+RELEASE_PARENT=""
+cleanup_release_parent() {
+  if [[ -n "$RELEASE_PARENT" ]]; then
+    rm -rf -- "$RELEASE_PARENT"
+  fi
+}
+trap cleanup_release_parent EXIT
+
 TARGET="${1:-}"
 SCOPE="${2:-full}"
+SOURCE_COMMIT_SHA="${SOURCE_COMMIT_SHA:-unknown}"
+SOURCE_COMMIT_SHORT_SHA="${SOURCE_COMMIT_SHA:0:7}"
 
 if [[ "$SCOPE" != "full" && "$SCOPE" != "events" ]]; then
   if [[ ! "$SCOPE" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
@@ -90,69 +100,71 @@ if [ -n "${BUILD_PATH}" ] && [ -d "${BUILD_PATH}" ]; then
     export MODE
     export SCOPE
     export BUILD_CACHE_TTL_MS
-    export BACKUP_TARGET="${TARGET}"
-    export BACKUP_SOURCE_DIR="${BUILD_PATH}"
-    export BACKUP_COMMIT_SHA="${SOURCE_COMMIT_SHA:-unknown}"
-    export BACKUP_COMMIT_SHORT_SHA="${BACKUP_COMMIT_SHA:0:7}"
-    export ASTRO_BUILD_BACKUP=1
-    bash "${ORCHESTRATOR_SCRIPT_ROOT:-/orchestrator/scripts}/backup-build.sh"
+    if [[ "$TARGET" == "production" ]]; then
+      export BACKUP_TARGET="production"
+      export BACKUP_SOURCE_DIR="${BUILD_PATH}"
+      bash "${ORCHESTRATOR_SCRIPT_ROOT:-/orchestrator/scripts}/backup-build.sh"
+    fi
     npm run build
 
+    RELEASE_PARENT="$(mktemp -d "${WORKDIR}/.release-output.XXXXXX")"
+    RELEASE_ROOT="${RELEASE_PARENT}/$(basename "${BUILD_PATH}")"
+    mkdir -p "${RELEASE_ROOT}"
+
+    if [[ "$SCOPE" != "full" && -d "${BUILD_PATH}" ]]; then
+      cp -R "${BUILD_PATH}/." "${RELEASE_ROOT}/"
+    fi
+
     if [[ "$TARGET" == "production" ]]; then
-      mkdir -p "${BUILD_PATH}/client"
+      mkdir -p "${RELEASE_ROOT}/client"
       if [[ "$SCOPE" != "full" ]]; then
         if [[ -d "./dist/client/${SCOPE}" ]]; then
-          rm -rf "${BUILD_PATH}/client/${SCOPE}"
-          cp -R "./dist/client/${SCOPE}" "${BUILD_PATH}/client/${SCOPE}"
+          rm -rf "${RELEASE_ROOT}/client/${SCOPE}"
+          cp -R "./dist/client/${SCOPE}" "${RELEASE_ROOT}/client/${SCOPE}"
           if [[ -d "./dist/client/_astro" ]]; then
-            rm -rf "${BUILD_PATH}/client/_astro"
-            cp -R "./dist/client/_astro" "${BUILD_PATH}/client/_astro"
+            rm -rf "${RELEASE_ROOT}/client/_astro"
+            cp -R "./dist/client/_astro" "${RELEASE_ROOT}/client/_astro"
           fi
         else
           echo "Scoped output ./dist/client/${SCOPE} not found; falling back to full deploy."
-          find "${BUILD_PATH}" -mindepth 1 -maxdepth 1 ! -name '.ssr' -exec rm -rf {} +
-          mkdir -p "${BUILD_PATH}/client"
-          cp -R ./dist/client/. "${BUILD_PATH}/client/"
+          find "${RELEASE_ROOT}" -mindepth 1 -maxdepth 1 ! -name '.ssr' -exec rm -rf {} +
+          mkdir -p "${RELEASE_ROOT}/client"
+          cp -R ./dist/client/. "${RELEASE_ROOT}/client/"
         fi
       else
-        find "${BUILD_PATH}" -mindepth 1 -maxdepth 1 ! -name '.ssr' -exec rm -rf {} +
-        mkdir -p "${BUILD_PATH}/client"
-        cp -R ./dist/client/. "${BUILD_PATH}/client/"
+        find "${RELEASE_ROOT}" -mindepth 1 -maxdepth 1 ! -name '.ssr' -exec rm -rf {} +
+        mkdir -p "${RELEASE_ROOT}/client"
+        cp -R ./dist/client/. "${RELEASE_ROOT}/client/"
       fi
 
-      stage_production_ssr_runtime "${SSR_RUNTIME_PATH}"
+      stage_production_ssr_runtime "${RELEASE_ROOT}/.ssr"
     else
       if [[ "$SCOPE" != "full" ]]; then
         if [[ -d "./dist/client/${SCOPE}" ]]; then
-          rm -rf "${BUILD_PATH}/client/${SCOPE}"
-          cp -R "./dist/client/${SCOPE}" "${BUILD_PATH}/client/${SCOPE}"
+          rm -rf "${RELEASE_ROOT}/client/${SCOPE}"
+          cp -R "./dist/client/${SCOPE}" "${RELEASE_ROOT}/client/${SCOPE}"
           if [[ -d "./dist/client/_astro" ]]; then
-            rm -rf "${BUILD_PATH}/client/_astro"
-            cp -R "./dist/client/_astro" "${BUILD_PATH}/client/_astro"
+            rm -rf "${RELEASE_ROOT}/client/_astro"
+            cp -R "./dist/client/_astro" "${RELEASE_ROOT}/client/_astro"
           fi
         else
           echo "Scoped output ./dist/client/${SCOPE} not found; falling back to full deploy."
-          find "${BUILD_PATH}" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
-          cp -R ./dist/. "${BUILD_PATH}/"
+          find "${RELEASE_ROOT}" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+          cp -R ./dist/. "${RELEASE_ROOT}/"
         fi
       else
-        find "${BUILD_PATH}" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
-        cp -R ./dist/. "${BUILD_PATH}/"
+        find "${RELEASE_ROOT}" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+        cp -R ./dist/. "${RELEASE_ROOT}/"
       fi
     fi
 
-    if [[ "$TARGET" == "production" ]]; then
-      STAGING_UPL="${STAGING_UPLOADS_DIR:-}"
-      PROD_UPLOADS="${PRODUCTION_UPLOADS_PATH:-}"
-      if [[ -n "$STAGING_UPL" && -d "$STAGING_UPL" && -n "$PROD_UPLOADS" ]]; then
-        echo "Syncing uploads to production..."
-        mkdir -p "$PROD_UPLOADS"
-        cp -Ru "$STAGING_UPL/." "$PROD_UPLOADS/"
-        echo "Uploads synced."
-      fi
-      echo "Warming production caches..."
-      bash "${ORCHESTRATOR_SCRIPT_ROOT:-/orchestrator/scripts}/warm-cache.sh" || echo "Cache warm failed (non-fatal)"
-    fi
+    RELEASE_ID="$(date -u +%Y%m%d-%H%M%S)-${SOURCE_COMMIT_SHORT_SHA:-unknown}"
+    ARCHIVE_DIR="${ASTRO_BUILD_STATIC_ARCHIVE_DIR:-${ASTRO_BUILD_ARCHIVE_DIR:-./build-archives}/static-backup}"
+    mkdir -p "$ARCHIVE_DIR"
+    ARCHIVE_PATH="${ARCHIVE_DIR%/}/abcnorio-astro-${TARGET}-${RELEASE_ID}.zip"
+    (cd "$RELEASE_PARENT" && zip -qr "$ARCHIVE_PATH" "$(basename "${BUILD_PATH}")")
+    echo "Built release archive: $ARCHIVE_PATH"
+    echo "release_id=$RELEASE_ID"
 
 else
     echo "Build path not set or missing for target=${TARGET}. Skipping Astro build."

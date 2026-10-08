@@ -13,7 +13,7 @@ const {
   listArchivesForTarget,
 } = await import('../files.mjs');
 
-const archiveDir = path.join(tempRoot, 'build-archives');
+const archiveDir = path.join(tempRoot, 'build-archives', 'static-backup');
 
 function resetArchiveDir() {
   fs.mkdirSync(archiveDir, { recursive: true });

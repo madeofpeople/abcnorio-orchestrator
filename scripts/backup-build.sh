@@ -3,9 +3,9 @@ set -e
 
 BACKUP_SOURCE_DIR="${BACKUP_SOURCE_DIR:-${PRODUCTION_BUILD_PATH:-../../web/static/prod}}"
 BACKUP_TARGET="${BACKUP_TARGET:-production}"
-BACKUP_COMMIT_SHORT_SHA="${BACKUP_COMMIT_SHORT_SHA:-unknown}"
-ARCHIVE_DIR="${ASTRO_BUILD_STATIC_ARCHIVE_DIR:-${ASTRO_BUILD_ARCHIVE_DIR:-./build-archives}/static-backup}"
-ARCHIVE_PATH="${ARCHIVE_DIR%/}/abcnorio-astro-${BACKUP_TARGET}-$(date +%Y%m%d-%H%M%S)-${BACKUP_COMMIT_SHORT_SHA}.zip"
+ARCHIVE_DIR="${ASTRO_BUILD_ROLLBACK_ARCHIVE_DIR:-${ASTRO_BUILD_ARCHIVE_DIR:-./build-archives}/rollback-snapshots}"
+ARCHIVE_PATH="${ARCHIVE_DIR%/}/abcnorio-rollback-${BACKUP_TARGET}-$(date -u +%Y%m%d-%H%M%S).zip"
+MAX_ROLLBACK_SNAPSHOTS=3
 
 if [[ "$ARCHIVE_DIR" != /* ]]; then
   ARCHIVE_DIR="$(pwd)/${ARCHIVE_DIR#./}"
@@ -33,3 +33,8 @@ fi
   cd "$SOURCE_PARENT_DIR"
   zip -qr "$FULL_ARCHIVE_PATH" "$SOURCE_BASENAME"
 )
+
+mapfile -t snapshots < <(ls -1t "${ARCHIVE_DIR}/abcnorio-rollback-${BACKUP_TARGET}-"*.zip 2>/dev/null || true)
+for ((index = MAX_ROLLBACK_SNAPSHOTS; index < ${#snapshots[@]}; index += 1)); do
+  rm -f -- "${snapshots[$index]}"
+done
