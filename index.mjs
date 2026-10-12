@@ -306,36 +306,6 @@ async function resolveLatestTagByPrefix(prefix) {
   });
 }
 
-async function resolveGitRefIfExists(ref) {
-  return new Promise((resolve, reject) => {
-    const proc = spawn('git', ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], {
-      cwd: SOURCE_GIT_ROOT,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-
-    let stdout = '';
-    let stderr = '';
-    proc.stdout.on('data', (d) => { stdout += d.toString(); });
-    proc.stderr.on('data', (d) => { stderr += d.toString(); });
-    proc.on('close', (code) => {
-      if (code === 0) {
-        resolve(stdout.trim());
-        return;
-      }
-
-      if (!stdout.trim() && !stderr.trim()) {
-        resolve(null);
-        return;
-      }
-
-      reject(new Error(`Failed to resolve git ref ${ref}: ${stderr.trim()}`));
-    });
-    proc.on('error', (err) => {
-      reject(new Error(`git process error: ${err.message}`));
-    });
-  });
-}
-
 function npmSpawnEnv() {
   const env = { ...process.env };
 
@@ -354,47 +324,6 @@ function npmSpawnEnv() {
   env.npm_config_cache = env.npm_config_cache || '/tmp/npm-cache';
 
   return env;
-}
-
-async function runGitCommand(args) {
-  return new Promise((resolve, reject) => {
-    const proc = spawn('git', args, {
-      cwd: SOURCE_GIT_ROOT,
-      stdio: 'inherit',
-    });
-
-    proc.on('close', (code) => {
-      if (code === 0) {
-        resolve();
-        return;
-      }
-
-      reject(new Error(`git ${args.join(' ')} failed with exit code ${code ?? 1}`));
-    });
-
-    proc.on('error', (err) => {
-      reject(new Error(`git process error: ${err.message}`));
-    });
-  });
-}
-
-async function tagProductionDeploy(commitSha, deployedAt) {
-  const deployDate = new Date(deployedAt).toISOString().slice(0, 10);
-  const shortSha = commitSha.slice(0, 7);
-  const tagName = `production-deploy-${deployDate}-${shortSha}`;
-
-  const existingCommitSha = await resolveGitRefIfExists(tagName);
-  if (existingCommitSha && existingCommitSha !== commitSha) {
-    throw new Error(`production tag ${tagName} already points to ${existingCommitSha}, expected ${commitSha}`);
-  }
-
-  if (!existingCommitSha) {
-    await runGitCommand(['tag', '-a', tagName, commitSha, '-m', `Production deploy ${deployDate} ${shortSha}`]);
-  }
-
-  await runGitCommand(['push', 'origin', tagName]);
-
-  return tagName;
 }
 
 // Export specific git commit tree to target directory via git archive
@@ -1063,16 +992,6 @@ async function buildJob(target, scope, requestedCommitSha = '', promotionState =
     throw error;
   }
   console.log(`[worker] ${target} deployed release_id=${deployedRelease.releaseId || 'unknown'} checksum=${deployedRelease.checksumSha256}`);
-  if (target === 'production') {
-    try {
-      const tagName = await tagProductionDeploy(sourceCommitSha, Date.now());
-      console.log(`[worker] production deploy tagged: ${tagName} @ ${sourceCommitSha}`);
-    } catch (error) {
-      const message = `production deployed release ${deployedRelease.releaseId}, but tagging failed: ${error instanceof Error ? error.message : String(error)}`;
-      failBuildJob(target, startedAt, message);
-      throw error;
-    }
-  }
 
   setRuntimeState({
     status: 'done',

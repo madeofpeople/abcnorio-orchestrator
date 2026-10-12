@@ -25,24 +25,24 @@ function resetArchiveDir() {
 test('listArchivesForTarget only returns matching target zip archives', () => {
   resetArchiveDir();
 
-  fs.writeFileSync(path.join(archiveDir, 'abcnorio-astro-dev-20260427-1200.zip'), 'x');
-  fs.writeFileSync(path.join(archiveDir, 'abcnorio-astro-staging-20260427-1201.zip'), 'x');
-  fs.writeFileSync(path.join(archiveDir, 'abcnorio-astro-dev-20260427-1200.txt'), 'x');
+  fs.writeFileSync(path.join(archiveDir, 'abcnorio-astro-production-20260427-1200.zip'), 'x');
+  fs.writeFileSync(path.join(archiveDir, 'abcnorio-astro-preview-20260427-1201.zip'), 'x');
+  fs.writeFileSync(path.join(archiveDir, 'abcnorio-astro-production-20260427-1200.txt'), 'x');
 
-  const result = listArchivesForTarget('dev');
+  const result = listArchivesForTarget('production');
 
   assert.equal(result.length, 1);
-  assert.equal(result[0], 'abcnorio-astro-dev-20260427-1200.zip');
+  assert.equal(result[0], 'abcnorio-astro-production-20260427-1200.zip');
 });
 
 test('resolveArchiveForTarget accepts valid archive in archive dir', () => {
   resetArchiveDir();
 
-  const fileName = 'abcnorio-astro-dev-20260427-1200.zip';
+  const fileName = 'abcnorio-astro-production-20260427-1200.zip';
   const archivePath = path.join(archiveDir, fileName);
   fs.writeFileSync(archivePath, 'x');
 
-  const resolved = resolveArchiveForTarget('dev', fileName);
+  const resolved = resolveArchiveForTarget('production', fileName);
 
   assert.equal(resolved, archivePath);
 });
@@ -50,10 +50,10 @@ test('resolveArchiveForTarget accepts valid archive in archive dir', () => {
 test('resolveArchiveForTarget rejects invalid prefix', () => {
   resetArchiveDir();
 
-  fs.writeFileSync(path.join(archiveDir, 'abcnorio-astro-staging-20260427-1200.zip'), 'x');
+  fs.writeFileSync(path.join(archiveDir, 'abcnorio-astro-preview-20260427-1200.zip'), 'x');
 
   assert.throws(
-    () => resolveArchiveForTarget('dev', 'abcnorio-astro-staging-20260427-1200.zip'),
+    () => resolveArchiveForTarget('production', 'abcnorio-astro-preview-20260427-1200.zip'),
     /invalid archive/
   );
 });
@@ -62,12 +62,12 @@ test('resolveArchiveForTarget rejects traversal-like filenames', () => {
   resetArchiveDir();
 
   assert.throws(
-    () => resolveArchiveForTarget('dev', 'abcnorio-astro-dev-../bad.zip'),
+    () => resolveArchiveForTarget('production', 'abcnorio-astro-production-../bad.zip'),
     /invalid archive/
   );
 
   assert.throws(
-    () => resolveArchiveForTarget('dev', '../abcnorio-astro-dev-20260427-1200.zip'),
+    () => resolveArchiveForTarget('production', '../abcnorio-astro-production-20260427-1200.zip'),
     /invalid archive/
   );
 });
@@ -76,23 +76,23 @@ test('resolveArchiveForTarget rejects missing file', () => {
   resetArchiveDir();
 
   assert.throws(
-    () => resolveArchiveForTarget('dev', 'abcnorio-astro-dev-20260427-1200.zip'),
+    () => resolveArchiveForTarget('production', 'abcnorio-astro-production-20260427-1200.zip'),
     /archive not found/
   );
 });
 
 test('assertDeployPath returns path for existing directory', () => {
-  const deployDir = path.join(tempRoot, 'deploy-dev');
+  const deployDir = path.join(tempRoot, 'deploy-production');
   fs.mkdirSync(deployDir, { recursive: true });
 
-  const resolved = assertDeployPath('dev', deployDir);
+  const resolved = assertDeployPath('production', deployDir);
 
   assert.equal(resolved, deployDir);
 });
 
 test('assertDeployPath throws for missing directory', () => {
   assert.throws(
-    () => assertDeployPath('dev', path.join(tempRoot, 'missing-deploy-dir')),
+    () => assertDeployPath('production', path.join(tempRoot, 'missing-deploy-dir')),
     /deploy path not found/
   );
 });

@@ -15,6 +15,7 @@ TARGET="${1:-}"
 SCOPE="${2:-full}"
 SOURCE_COMMIT_SHA="${SOURCE_COMMIT_SHA:-unknown}"
 SOURCE_COMMIT_SHORT_SHA="${SOURCE_COMMIT_SHA:0:7}"
+BUILD_CACHE_TTL_MS=0
 
 if [[ "$SCOPE" != "full" && "$SCOPE" != "events" ]]; then
   if [[ ! "$SCOPE" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
@@ -24,32 +25,16 @@ if [[ "$SCOPE" != "full" && "$SCOPE" != "events" ]]; then
 fi
 
 case "$TARGET" in
-  dev)
-    MODE=development
-    BUILD_PATH="${DEV_BUILD_PATH:-}"
-    BUILD_CACHE_TTL_MS=0
-    SSR_RUNTIME_PATH=""
-    ;;
-  staging)
-    MODE=staging
-    BUILD_PATH="${STAGING_BUILD_PATH:-}"
-    BUILD_CACHE_TTL_MS=0
-    SSR_RUNTIME_PATH=""
-    ;;
   production)
     MODE=production
     BUILD_PATH="${PRODUCTION_BUILD_PATH:-}"
-    BUILD_CACHE_TTL_MS=0
-    SSR_RUNTIME_PATH="${BUILD_PATH}/.ssr"
     ;;
   preview)
     MODE=preview
     BUILD_PATH="${PREVIEW_BUILD_PATH:-}"
-    BUILD_CACHE_TTL_MS=0
-    SSR_RUNTIME_PATH=""
     ;;
   *)
-    echo "Invalid target: $TARGET (expected: dev|staging|production|preview)"
+    echo "Invalid target: $TARGET (expected: production|preview)"
     exit 1
     ;;
 esac
