@@ -7,10 +7,20 @@ import test from 'node:test';
 const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'abcnorio-dev-tools-test-'));
 process.env.STAGING_UPLOADS_DIR = path.join(tempRoot, 'staging-uploads');
 process.env.DEV_UPLOADS_DIR = path.join(tempRoot, 'dev-uploads');
+process.env.ASTRO_BUILD_DATABASE_ARCHIVE_DIR = path.join(tempRoot, 'database-backups');
+process.env.MAX_DATABASE_BACKUPS = '2';
 fs.mkdirSync(process.env.STAGING_UPLOADS_DIR, { recursive: true });
 fs.mkdirSync(process.env.DEV_UPLOADS_DIR, { recursive: true });
 
-const { copyMediaFiles, startDevOp, dumpDatabase, devToolsState } = await import('../dev-tools.mjs');
+const {
+  copyMediaFiles,
+  startDevOp,
+  dumpDatabase,
+  createDatabaseBackupArchive,
+  listDatabaseBackups,
+  resolveDatabaseBackupArchive,
+  devToolsState,
+} = await import('../dev-tools.mjs');
 
 function resetState(key) {
   devToolsState[key] = { status: 'idle', started: null, finished: null, message: null };
@@ -117,5 +127,49 @@ test('dumpDatabase rejects with descriptive error when host is unreachable', asy
       assert.match(err.message, /mysqldump/);
       return true;
     }
+  );
+});
+
+test('database backups are created and retained separately for Dev and Staging', async () => {
+  const archiveDir = process.env.ASTRO_BUILD_DATABASE_ARCHIVE_DIR;
+  fs.mkdirSync(archiveDir, { recursive: true });
+  const now = Date.now();
+  for (const [env, count] of [['dev', 2], ['staging', 3]]) {
+    for (let index = 0; index < count; index += 1) {
+      const name = `abcnorio-database-${env}-20261012-00000${index}.sql`;
+      const filePath = path.join(archiveDir, name);
+      fs.writeFileSync(filePath, `old ${env} ${index}`);
+      const oldTime = new Date(now - (count - index) * 60_000);
+      fs.utimesSync(filePath, oldTime, oldTime);
+    }
+  }
+
+  const binDir = path.join(tempRoot, 'fake-bin');
+  fs.mkdirSync(binDir, { recursive: true });
+  const mysqldump = path.join(binDir, 'mysqldump');
+  fs.writeFileSync(mysqldump, '#!/bin/sh\nprintf "fixture SQL\\n"\n', { mode: 0o755 });
+  const originalPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${originalPath}`;
+  let backupName;
+  try {
+    backupName = await createDatabaseBackupArchive({
+      host: 'unused',
+      user: 'test',
+      password: 'test',
+      name: 'dev_db',
+    }, 'dev');
+  } finally {
+    process.env.PATH = originalPath;
+  }
+
+  assert.match(backupName, /^abcnorio-database-dev-[a-zA-Z0-9_-]+\.sql$/);
+  assert.equal(fs.readFileSync(path.join(archiveDir, backupName), 'utf8'), 'fixture SQL\n');
+  assert.equal(listDatabaseBackups('dev').length, 2);
+  assert.equal(listDatabaseBackups('staging').length, 2);
+  assert.equal(fs.readdirSync(archiveDir).filter((name) => name.startsWith('abcnorio-database-staging-')).length, 3);
+  assert.equal(resolveDatabaseBackupArchive(backupName, 'dev'), path.join(archiveDir, backupName));
+  assert.throws(
+    () => resolveDatabaseBackupArchive(backupName, 'staging'),
+    /invalid archive/
   );
 });

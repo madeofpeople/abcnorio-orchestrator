@@ -669,11 +669,17 @@ const DEV_OPS = {
     label: 'backup-media-staging',
     run: () => createMediaBackupArchive(uploads.staging, 'staging').then((name) => `Staging media backup created: ${name}`),
   },
+  '/dev-tools/backup-database-dev': {
+    key: 'backupDatabaseDev',
+    label: 'backup-database-dev',
+    requiresDb: true,
+    run: () => createDatabaseBackupArchive(db.dev, 'dev').then((name) => `Dev database backup created: ${name}`),
+  },
   '/dev-tools/backup-database-staging': {
     key: 'backupDatabaseStaging',
     label: 'backup-database-staging',
     requiresDb: true,
-    run: () => createDatabaseBackupArchive(db.staging).then((name) => `Staging database backup created: ${name}`),
+    run: () => createDatabaseBackupArchive(db.staging, 'staging').then((name) => `Staging database backup created: ${name}`),
   },
   '/dev-tools/pull-from-dev': {
     key: 'pullDBFromDevToStaging',
@@ -779,6 +785,10 @@ const DEV_OPS = {
 if (!SECRET) {
   console.error('[startup] FATAL: ASTRO_BUILD_TRIGGER_SECRET is not set — refusing to start');
   process.exit(1);
+}
+
+function isKnownDatabaseBackupTarget(target) {
+  return target === 'dev' || target === 'staging';
 }
 
 if (!Object.values(TARGETS).some(Boolean)) {
@@ -1378,13 +1388,24 @@ app.get('/dev-tools/media-backups', (c) => {
   });
 });
 
-app.get('/dev-tools/database-backups', (c) => jsonOk(c, 200, { backups: listDatabaseBackups() }));
+app.get('/dev-tools/database-backups', (c) => {
+  const target = String(c.req.query('target') || '').trim();
+  if (!isKnownDatabaseBackupTarget(target)) {
+    return jsonError(c, 400, 'invalid_target', 'invalid target', { valid: MEDIA_SYNC_TARGETS });
+  }
+
+  return jsonOk(c, 200, { target, backups: listDatabaseBackups(target) });
+});
 
 app.get('/dev-tools/database-backups/download', (c) => {
+  const target = String(c.req.query('target') || '').trim();
   const file = String(c.req.query('file') || '').trim();
+  if (!isKnownDatabaseBackupTarget(target)) {
+    return jsonError(c, 400, 'invalid_target', 'invalid target', { valid: MEDIA_SYNC_TARGETS });
+  }
 
   try {
-    const archivePath = resolveDatabaseBackupArchive(file);
+    const archivePath = resolveDatabaseBackupArchive(file, target);
     const stat = fs.statSync(archivePath);
     const stream = fs.createReadStream(archivePath);
     c.header('Content-Type', 'application/sql');
@@ -1404,11 +1425,15 @@ app.post('/dev-tools/database-backups/delete', async (c) => {
     return jsonError(c, 400, 'invalid_json', 'invalid json');
   }
 
+  const target = String(parsed?.target || '').trim();
   const file = String(parsed?.file || '').trim();
+  if (!isKnownDatabaseBackupTarget(target)) {
+    return jsonError(c, 400, 'invalid_target', 'invalid target', { valid: MEDIA_SYNC_TARGETS });
+  }
   try {
-    const archivePath = resolveDatabaseBackupArchive(file);
+    const archivePath = resolveDatabaseBackupArchive(file, target);
     fs.unlinkSync(archivePath);
-    return jsonOk(c, 200, { status: 'deleted', file });
+    return jsonOk(c, 200, { status: 'deleted', target, file });
   } catch (error) {
     return jsonError(c, 404, 'delete_failed', error instanceof Error ? error.message : 'unknown error');
   }

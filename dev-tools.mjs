@@ -189,11 +189,20 @@ export function createMediaBackupArchive(sourceDir, target) {
   });
 }
 
-function cleanupOldDatabaseBackups() {
+function databaseBackupPrefix(target) {
+  if (target !== 'dev' && target !== 'staging') {
+    throw new Error(`invalid database backup target: ${target}`);
+  }
+
+  return `abcnorio-database-${target}-`;
+}
+
+function cleanupOldDatabaseBackups(target) {
   if (!fs.existsSync(DATABASE_ARCHIVE_DIR)) return;
 
+  const prefix = databaseBackupPrefix(target);
   const backups = fs.readdirSync(DATABASE_ARCHIVE_DIR)
-    .filter((name) => name.startsWith('abcnorio-database-staging-') && name.endsWith('.sql'))
+    .filter((name) => name.startsWith(prefix) && name.endsWith('.sql'))
     .map((name) => ({
       name,
       fullPath: path.join(DATABASE_ARCHIVE_DIR, name),
@@ -205,16 +214,17 @@ function cleanupOldDatabaseBackups() {
     try {
       fs.unlinkSync(backup.fullPath);
     } catch (error) {
-      console.warn(`[backup-database-staging] failed to delete old archive ${backup.name}: ${error.message}`);
+      console.warn(`[backup-database-${target}] failed to delete old archive ${backup.name}: ${error.message}`);
     }
   }
 }
 
-export function listDatabaseBackups() {
+export function listDatabaseBackups(target) {
   if (!fs.existsSync(DATABASE_ARCHIVE_DIR)) return [];
 
+  const prefix = databaseBackupPrefix(target);
   return fs.readdirSync(DATABASE_ARCHIVE_DIR)
-    .filter((name) => name.startsWith('abcnorio-database-staging-') && name.endsWith('.sql'))
+    .filter((name) => name.startsWith(prefix) && name.endsWith('.sql'))
     .map((name) => ({
       name,
       mtime: fs.statSync(path.join(DATABASE_ARCHIVE_DIR, name)).mtimeMs,
@@ -223,9 +233,10 @@ export function listDatabaseBackups() {
     .slice(0, MAX_DATABASE_BACKUPS);
 }
 
-export function resolveDatabaseBackupArchive(requestedName) {
+export function resolveDatabaseBackupArchive(requestedName, target) {
   const name = String(requestedName || '').trim();
-  if (!/^abcnorio-database-staging-[a-zA-Z0-9_-]+\.sql$/.test(name)) {
+  const prefix = databaseBackupPrefix(target);
+  if (!name.startsWith(prefix) || !/^[a-zA-Z0-9_-]+\.sql$/.test(name.slice(prefix.length))) {
     throw new Error('invalid archive');
   }
 
@@ -240,11 +251,12 @@ export function resolveDatabaseBackupArchive(requestedName) {
   return archivePath;
 }
 
-export function createDatabaseBackupArchive(source) {
+export function createDatabaseBackupArchive(source, target) {
   fs.mkdirSync(DATABASE_ARCHIVE_DIR, { recursive: true });
 
+  const prefix = databaseBackupPrefix(target);
   const timestamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15);
-  const archiveName = `abcnorio-database-staging-${timestamp}.sql`;
+  const archiveName = `${prefix}${timestamp}.sql`;
   const archivePath = path.join(DATABASE_ARCHIVE_DIR, archiveName);
   const tempPath = `${archivePath}.tmp`;
 
@@ -272,7 +284,7 @@ export function createDatabaseBackupArchive(source) {
     output.on('finish', () => {
       if (!fs.existsSync(tempPath)) return;
       fs.renameSync(tempPath, archivePath);
-      cleanupOldDatabaseBackups();
+      cleanupOldDatabaseBackups(target);
       resolve(archiveName);
     });
     dump.on('error', (error) => {
