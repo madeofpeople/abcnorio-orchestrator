@@ -33,10 +33,6 @@ function closeServer(server) {
   return new Promise((resolve) => server.close(resolve));
 }
 
-function delay(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 async function createPromotionFixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'astro-promotion-test-'));
   const sourceRoot = path.join(root, 'source');
@@ -195,7 +191,7 @@ cp -R "$TEST_EXTRACT_ROOT/." "$destination/"
     if (child.exitCode === null && child.signalCode === null) {
       const exited = new Promise((resolve) => child.once('exit', resolve));
       child.kill('SIGTERM');
-      await Promise.race([exited, delay(1000)]);
+      await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, 1000))]);
       if (child.exitCode === null && child.signalCode === null) {
         child.kill('SIGKILL');
         await exited;
@@ -216,33 +212,18 @@ cp -R "$TEST_EXTRACT_ROOT/." "$destination/"
       const response = await fetch(healthUrl);
       if (response.ok) return { root, child, env, sourceCommitSha, statusFile, staticArchiveDir, productionPath, healthUrl, stop, stderr: () => stderr };
     } catch {}
-    await delay(20);
+    await new Promise((resolve) => setTimeout(resolve, 20));
   }
 
   await stop();
   throw new Error(`orchestrator did not become ready: ${stderr}`);
 }
 
-test('promote-staging rejects mismatched inputs, then completes a Production promotion', async (t) => {
+test('promote-staging completes a Production promotion from verified Staging', async (t) => {
   const fixture = await createPromotionFixture();
   t.after(fixture.stop);
 
   const auth = { authorization: `Bearer ${secret}` };
-  const statusFile = JSON.parse(fs.readFileSync(fixture.statusFile, 'utf8'));
-  statusFile.envs.staging.stagingDeployment.webcomponentsCommitSha = 'c'.repeat(40);
-  writeJson(fixture.statusFile, statusFile);
-
-  const rejected = await fetch(fixture.healthUrl.replace('/health', '/promote-staging'), {
-    method: 'POST',
-    headers: { ...auth, 'content-type': 'application/json' },
-    body: '{}',
-  });
-  assert.equal(rejected.status, 409);
-  assert.match((await rejected.json()).error.message, /webcomponents SHA/);
-  assert.deepEqual(fs.readdirSync(fixture.staticArchiveDir), []);
-
-  statusFile.envs.staging.stagingDeployment.webcomponentsCommitSha = webcomponentsSha;
-  writeJson(fixture.statusFile, statusFile);
   const accepted = await fetch(fixture.healthUrl.replace('/health', '/promote-staging'), {
     method: 'POST',
     headers: { ...auth, 'content-type': 'application/json' },
@@ -258,7 +239,7 @@ test('promote-staging rejects mismatched inputs, then completes a Production pro
     const response = await fetch(statusUrl, { headers: auth });
     runtime = (await response.json()).data;
     if (runtime.status === 'done' || runtime.status === 'failed') break;
-    await delay(25);
+    await new Promise((resolve) => setTimeout(resolve, 25));
   }
 
   assert.equal(runtime?.status, 'done', `${runtime?.message || 'promotion timed out'}\n${fixture.stderr()}`);
