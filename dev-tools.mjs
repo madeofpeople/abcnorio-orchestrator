@@ -121,6 +121,11 @@ export function copyMediaFiles(src, dest) {
   return fs.promises.cp(src, dest, { recursive: true, force: false, errorOnExist: false });
 }
 
+// object-cache.php purges this site's APCu entries when this marker changes.
+export function flushObjectCache(uploadsDir) {
+  fs.writeFileSync(path.join(uploadsDir, '.object-cache-namespace'), String(Date.now()), { mode: 0o664 });
+}
+
 function cleanupOldMediaBackups(target) {
   if (!fs.existsSync(MEDIA_ARCHIVE_DIR)) {
     return;
