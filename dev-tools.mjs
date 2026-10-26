@@ -305,7 +305,58 @@ export function createDatabaseBackupArchive(source, target) {
   });
 }
 
-export function dumpDatabase(src, dest) {
+// Per-site options that must survive a DB sync. The Mailchimp OAuth token is
+// encrypted with the site's salts, so a copy from another environment can't be decrypted.
+const PRESERVE_OPTIONS = [
+  'mailchimp_sf_access_token',
+  'mailchimp_sf_auth_error',
+  'mc_datacenter',
+  'mc_api_key',
+];
+
+function runMysql(conn, sql) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn('mysql', [
+      `--host=${conn.host}`,
+      `--user=${conn.user}`,
+      '--ssl=FALSE',
+      '--batch',
+      '--skip-column-names',
+      conn.name,
+      '-e',
+      sql,
+    ], { env: { ...process.env, MYSQL_PWD: conn.password } });
+
+    let out = '';
+    let err = '';
+    proc.stdout.on('data', (d) => { out += d.toString(); });
+    proc.stderr.on('data', (d) => { err += d.toString(); });
+    proc.on('error', (e) => reject(new Error(`mysql error: ${e.message}`)));
+    proc.on('close', (code) => (code === 0 ? resolve(out) : reject(new Error(`mysql failed: ${err.trim()}`))));
+  });
+}
+
+// Values travel as hex so encrypted/binary-ish strings survive the round trip.
+async function readPreservedOptions(conn) {
+  const names = PRESERVE_OPTIONS.map((n) => `'${n}'`).join(',');
+  const out = await runMysql(conn, `SELECT option_name, HEX(option_value) FROM wp_options WHERE option_name IN (${names})`);
+  return out.split('\n').filter(Boolean).map((line) => line.split('\t'));
+}
+
+async function writePreservedOptions(conn, saved) {
+  const names = PRESERVE_OPTIONS.map((n) => `'${n}'`).join(',');
+  const inserts = saved.map(([name, hex]) =>
+    `INSERT INTO wp_options (option_name, option_value, autoload) VALUES ('${name}', UNHEX('${hex}'), 'no')`);
+  await runMysql(conn, [`DELETE FROM wp_options WHERE option_name IN (${names})`, ...inserts].join('; '));
+}
+
+export async function dumpDatabase(src, dest) {
+  const saved = await readPreservedOptions(dest);
+  await copyDatabase(src, dest);
+  await writePreservedOptions(dest, saved);
+}
+
+function copyDatabase(src, dest) {
   return new Promise((resolve, reject) => {
     const dump = spawn('mysqldump', [
       `--host=${src.host}`,
