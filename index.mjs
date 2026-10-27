@@ -6,7 +6,7 @@ import { Hono } from 'hono';
 import { serve } from '@hono/node-server';
 import { z } from 'zod';
 import { enqueue, getQueueStatus } from './queue.mjs';
-import { devToolsState, startDevOp, copyMediaFiles, createMediaBackupArchive, createDatabaseBackupArchive, listDatabaseBackups, resolveDatabaseBackupArchive, dumpDatabase, flushObjectCache, uploads, db, assertUploadsContract } from './dev-tools.mjs';
+import { devToolsState, startDevOp, copyMediaFiles, syncGeneratedImageDerivatives, createMediaBackupArchive, createDatabaseBackupArchive, listDatabaseBackups, resolveDatabaseBackupArchive, dumpDatabase, flushObjectCache, uploads, db, assertUploadsContract } from './dev-tools.mjs';
 import {
   listArchivesForTarget,
   runCommand,
@@ -118,7 +118,7 @@ const TARGETS = {
 const PRODUCTION_HOST = (process.env.PRODUCTION_HOST || '').replace(/\/$/, '');
 const PREVIEW_HOST = (process.env.PREVIEW_HOST || '').replace(/\/$/, '');
 const SMOKE_HTTP_TIMEOUT_MS = Number(process.env.ORCHESTRATOR_SMOKE_HTTP_TIMEOUT_MS || 10000);
-const MEDIA_SYNC_TARGETS = ['dev', 'staging'];
+const MEDIA_SYNC_TARGETS = ['dev', 'staging', 'production'];
 
 assertRequiredEnvVars(REQUIRED_ENV);
 
@@ -668,6 +668,16 @@ const DEV_OPS = {
     key: 'backupMediaStaging',
     label: 'backup-media-staging',
     run: () => createMediaBackupArchive(uploads.staging, 'staging').then((name) => `Staging media backup created: ${name}`),
+  },
+  '/dev-tools/sync-regenerated-thumbnails-to-production': {
+    key: 'syncRegeneratedThumbnailsToProduction',
+    label: 'sync-regenerated-thumbnails-to-production',
+    writesProduction: true,
+    run: async () => {
+      const backupName = await createMediaBackupArchive(uploads.production, 'production');
+      const { copiedFiles, copiedBytes } = await syncGeneratedImageDerivatives(uploads.staging, uploads.production);
+      return `Production uploads backed up to ${backupName}; copied ${copiedFiles} regenerated image derivatives (${copiedBytes} bytes) from staging.`;
+    },
   },
   '/dev-tools/backup-database-dev': {
     key: 'backupDatabaseDev',
@@ -1508,14 +1518,28 @@ app.post('/dev-tools/:op', async (c) => {
     return jsonError(c, 404, 'not_found', 'not found');
   }
 
+  if (opDef.writesProduction && productionWriteInProgress) {
+    return jsonError(c, 409, 'production_operation_running', 'a production deploy or restore is already running');
+  }
+  if (opDef.writesProduction && !uploads.production) {
+    return jsonError(c, 500, 'production_uploads_path_missing', 'PRODUCTION_UPLOADS_PATH is not configured');
+  }
   if (opDef.requiresStaging && !STAGING_WORKDIR) {
     return jsonError(c, 500, 'staging_root_missing', 'ASTRO_STAGING_SITE_ROOT is not configured');
   }
   if (opDef.requiresDb && (!db.dev.name || !db.staging.name)) {
     return jsonError(c, 500, 'db_env_missing', 'DB env vars not configured (DEV_DB_NAME / STAGING_DB_NAME)');
   }
-  const started = startDevOp(opDef.key, opDef.label, opDef.run);
+  if (opDef.writesProduction) productionWriteInProgress = true;
+  const started = startDevOp(opDef.key, opDef.label, async () => {
+    try {
+      return await opDef.run();
+    } finally {
+      if (opDef.writesProduction) productionWriteInProgress = false;
+    }
+  });
   if (!started) {
+    if (opDef.writesProduction) productionWriteInProgress = false;
     return jsonError(c, 409, 'already_in_progress', 'already in progress');
   }
   return jsonOk(c, 202, { status: 'running' });

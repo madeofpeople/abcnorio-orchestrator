@@ -5,6 +5,7 @@ import { spawn } from 'node:child_process';
 export const uploads = {
   staging: process.env.STAGING_UPLOADS_DIR || '/staging-uploads',
   dev: process.env.DEV_UPLOADS_DIR || '/dev-uploads',
+  production: process.env.PRODUCTION_UPLOADS_PATH || '',
 };
 
 const SHARED_UID = Number(process.env.PROJECT_UID || 1000);
@@ -88,6 +89,7 @@ export const devToolsState = {
   pullDBFromDevToStaging: idleDevToolState(),
   backupMediaDev: idleDevToolState(),
   backupMediaStaging: idleDevToolState(),
+  syncRegeneratedThumbnailsToProduction: idleDevToolState(),
   backupDatabaseStaging: idleDevToolState(),
 };
 
@@ -119,6 +121,53 @@ export function startDevOp(key, label, asyncFn) {
 
 export function copyMediaFiles(src, dest) {
   return fs.promises.cp(src, dest, { recursive: true, force: false, errorOnExist: false });
+}
+
+export async function syncGeneratedImageDerivatives(src, dest) {
+  const sourceStat = await fs.promises.stat(src);
+  if (!sourceStat.isDirectory()) {
+    throw new Error(`staging uploads path is not a directory: ${src}`);
+  }
+
+  if (!dest) {
+    throw new Error('production uploads path is not configured');
+  }
+
+  const sourcePath = path.resolve(src);
+  const destinationPath = path.resolve(dest);
+  if (sourcePath === destinationPath) {
+    throw new Error('staging and production uploads paths must differ');
+  }
+
+  const derivativePattern = /-\d+x\d+\.(?:avif|gif|jpe?g|png|webp)$/i;
+  let copiedFiles = 0;
+  let copiedBytes = 0;
+
+  async function copyDirectory(sourceDirectory, destinationDirectory) {
+    const entries = await fs.promises.readdir(sourceDirectory, { withFileTypes: true });
+
+    for (const entry of entries) {
+      const sourceFile = path.join(sourceDirectory, entry.name);
+      const destinationFile = path.join(destinationDirectory, entry.name);
+
+      if (entry.isDirectory()) {
+        await copyDirectory(sourceFile, destinationFile);
+        continue;
+      }
+
+      if (!entry.isFile() || !derivativePattern.test(entry.name)) {
+        continue;
+      }
+
+      await fs.promises.mkdir(destinationDirectory, { recursive: true });
+      await fs.promises.copyFile(sourceFile, destinationFile);
+      copiedFiles += 1;
+      copiedBytes += (await fs.promises.stat(sourceFile)).size;
+    }
+  }
+
+  await copyDirectory(sourcePath, destinationPath);
+  return { copiedFiles, copiedBytes };
 }
 
 // object-cache.php purges this site's APCu entries when this marker changes.

@@ -7,13 +7,16 @@ import test from 'node:test';
 const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'abcnorio-dev-tools-test-'));
 process.env.STAGING_UPLOADS_DIR = path.join(tempRoot, 'staging-uploads');
 process.env.DEV_UPLOADS_DIR = path.join(tempRoot, 'dev-uploads');
+process.env.PRODUCTION_UPLOADS_PATH = path.join(tempRoot, 'production-uploads');
 process.env.ASTRO_BUILD_DATABASE_ARCHIVE_DIR = path.join(tempRoot, 'database-backups');
 process.env.MAX_DATABASE_BACKUPS = '2';
 fs.mkdirSync(process.env.STAGING_UPLOADS_DIR, { recursive: true });
 fs.mkdirSync(process.env.DEV_UPLOADS_DIR, { recursive: true });
+fs.mkdirSync(process.env.PRODUCTION_UPLOADS_PATH, { recursive: true });
 
 const {
   copyMediaFiles,
+  syncGeneratedImageDerivatives,
   startDevOp,
   dumpDatabase,
   createDatabaseBackupArchive,
@@ -59,6 +62,26 @@ test('copyMediaFiles copies nested directories', async () => {
   await copyMediaFiles(src, dest);
 
   assert.ok(fs.existsSync(path.join(dest, '2026', '04', 'photo.jpg')));
+});
+
+test('syncGeneratedImageDerivatives overwrites generated sizes but preserves originals', async () => {
+  const src = fs.mkdtempSync(path.join(os.tmpdir(), 'thumb-src-'));
+  const dest = fs.mkdtempSync(path.join(os.tmpdir(), 'thumb-dest-'));
+  fs.mkdirSync(path.join(src, '2026', '04'), { recursive: true });
+  fs.mkdirSync(path.join(dest, '2026', '04'), { recursive: true });
+  fs.writeFileSync(path.join(src, '2026', '04', 'poster-353x457.webp'), 'new derivative');
+  fs.writeFileSync(path.join(src, '2026', '04', 'poster.webp'), 'staging original');
+  fs.writeFileSync(path.join(dest, '2026', '04', 'poster-353x457.webp'), 'old derivative');
+  fs.writeFileSync(path.join(dest, '2026', '04', 'poster.webp'), 'production original');
+
+  const result = await syncGeneratedImageDerivatives(src, dest);
+
+  assert.deepEqual(result, {
+    copiedFiles: 1,
+    copiedBytes: Buffer.byteLength('new derivative'),
+  });
+  assert.equal(fs.readFileSync(path.join(dest, '2026', '04', 'poster-353x457.webp'), 'utf8'), 'new derivative');
+  assert.equal(fs.readFileSync(path.join(dest, '2026', '04', 'poster.webp'), 'utf8'), 'production original');
 });
 
 // --- startDevOp ---
