@@ -10,8 +10,6 @@ export const uploads = {
 
 const SHARED_UID = Number(process.env.PROJECT_UID || 1000);
 const SHARED_GID = Number(process.env.PROJECT_GID || 2000);
-const MAX_MEDIA_BACKUPS = Math.max(1, Number(process.env.MAX_MEDIA_BACKUPS || 2));
-const MAX_DATABASE_BACKUPS = Math.max(1, Number(process.env.MAX_DATABASE_BACKUPS || 2));
 const BASE_ARCHIVE_DIR = process.env.ASTRO_BUILD_ARCHIVE_DIR
   ? path.resolve(process.env.ASTRO_BUILD_ARCHIVE_DIR)
   : path.resolve(process.env.ASTRO_BUILD_WORKDIR || '/astro-build', 'build-archives');
@@ -176,7 +174,35 @@ export function flushObjectCache(uploadsDir) {
   fs.writeFileSync(path.join(uploadsDir, '.object-cache-namespace'), String(Date.now()), { mode: 0o664 });
 }
 
-function cleanupOldMediaBackups(target) {
+// Keep names and defaults in sync with BackupRetentionSettings.php in abcnorio-func.
+const RETENTION_OPTIONS = {
+  abcnorio_retention_production_archives: ['productionArchives', 3],
+  abcnorio_retention_rollback_snapshots: ['rollbackSnapshots', 3],
+  abcnorio_retention_media_backups: ['mediaBackups', 3],
+  abcnorio_retention_database_backups: ['databaseBackups', 3],
+};
+
+// Retention is set in Settings > ABC No Rio on the staging site and read at prune time.
+export async function readRetention() {
+  const retention = Object.fromEntries(Object.values(RETENTION_OPTIONS));
+  if (!db.staging.name) return retention;
+
+  const names = Object.keys(RETENTION_OPTIONS).map((n) => `'${n}'`).join(',');
+  try {
+    const out = await runMysql(db.staging, `SELECT option_name, option_value FROM wp_options WHERE option_name IN (${names})`);
+    for (const line of out.split('\n').filter(Boolean)) {
+      const [option, value] = line.split('\t');
+      const [key] = RETENTION_OPTIONS[option];
+      retention[key] = Math.max(1, Number(value) || retention[key]);
+    }
+  } catch (error) {
+    console.warn(`[retention] using defaults, could not read settings: ${error.message}`);
+  }
+  return retention;
+}
+
+async function cleanupOldMediaBackups(target) {
+  const maxKeep = (await readRetention()).mediaBackups;
   if (!fs.existsSync(MEDIA_ARCHIVE_DIR)) {
     return;
   }
@@ -185,7 +211,7 @@ function cleanupOldMediaBackups(target) {
   const names = fs.readdirSync(MEDIA_ARCHIVE_DIR)
     .filter((name) => name.startsWith(prefix) && name.endsWith('.zip'));
 
-  if (names.length <= MAX_MEDIA_BACKUPS) {
+  if (names.length <= maxKeep) {
     return;
   }
 
@@ -196,7 +222,7 @@ function cleanupOldMediaBackups(target) {
     })
     .sort((a, b) => b.mtime - a.mtime);
 
-  for (let i = MAX_MEDIA_BACKUPS; i < sortedByMtime.length; i += 1) {
+  for (let i = maxKeep; i < sortedByMtime.length; i += 1) {
     try {
       fs.unlinkSync(sortedByMtime[i].fullPath);
     } catch (error) {
@@ -234,8 +260,7 @@ export function createMediaBackupArchive(sourceDir, target) {
         return;
       }
 
-      cleanupOldMediaBackups(target);
-      resolve(archiveName);
+      cleanupOldMediaBackups(target).then(() => resolve(archiveName), reject);
     });
 
     zipProc.on('error', (error) => {
@@ -252,9 +277,10 @@ function databaseBackupPrefix(target) {
   return `abcnorio-database-${target}-`;
 }
 
-function cleanupOldDatabaseBackups(target) {
+async function cleanupOldDatabaseBackups(target) {
   if (!fs.existsSync(DATABASE_ARCHIVE_DIR)) return;
 
+  const maxKeep = (await readRetention()).databaseBackups;
   const prefix = databaseBackupPrefix(target);
   const backups = fs.readdirSync(DATABASE_ARCHIVE_DIR)
     .filter((name) => name.startsWith(prefix) && name.endsWith('.sql'))
@@ -265,7 +291,7 @@ function cleanupOldDatabaseBackups(target) {
     }))
     .sort((a, b) => b.mtime - a.mtime);
 
-  for (const backup of backups.slice(MAX_DATABASE_BACKUPS)) {
+  for (const backup of backups.slice(maxKeep)) {
     try {
       fs.unlinkSync(backup.fullPath);
     } catch (error) {
@@ -284,8 +310,7 @@ export function listDatabaseBackups(target) {
       name,
       mtime: fs.statSync(path.join(DATABASE_ARCHIVE_DIR, name)).mtimeMs,
     }))
-    .sort((a, b) => b.mtime - a.mtime)
-    .slice(0, MAX_DATABASE_BACKUPS);
+    .sort((a, b) => b.mtime - a.mtime);
 }
 
 export function resolveDatabaseBackupArchive(requestedName, target) {
@@ -339,8 +364,7 @@ export function createDatabaseBackupArchive(source, target) {
     output.on('finish', () => {
       if (!fs.existsSync(tempPath)) return;
       fs.renameSync(tempPath, archivePath);
-      cleanupOldDatabaseBackups(target);
-      resolve(archiveName);
+      cleanupOldDatabaseBackups(target).then(() => resolve(archiveName), reject);
     });
     dump.on('error', (error) => {
       output.destroy();
@@ -362,6 +386,10 @@ const PRESERVE_OPTIONS = [
   'mailchimp_sf_auth_error',
   'mc_datacenter',
   'mc_api_key',
+  'abcnorio_retention_production_archives',
+  'abcnorio_retention_rollback_snapshots',
+  'abcnorio_retention_media_backups',
+  'abcnorio_retention_database_backups',
 ];
 
 function runMysql(conn, sql) {
@@ -432,19 +460,28 @@ export function copyDatabase(src, dest) {
     dump.stderr.on('data', (d) => { dumpErr += d.toString(); });
     restore.stderr.on('data', (d) => { restoreErr += d.toString(); });
 
-    dump.on('close', (code) => {
-      dumpCode = code;
-      if (code !== 0) restore.stdin.destroy();
-    });
+    let restoreCode = null;
 
-    restore.on('close', (code) => {
+    const finish = () => {
+      if (dumpCode === null || restoreCode === null) return;
       if (dumpCode !== 0) {
         reject(new Error(`mysqldump failed: ${dumpErr.trim()}`));
-      } else if (code !== 0) {
+      } else if (restoreCode !== 0) {
         reject(new Error(`mysql restore failed: ${restoreErr.trim()}`));
       } else {
         resolve();
       }
+    };
+
+    dump.on('close', (code) => {
+      dumpCode = code;
+      if (code !== 0) restore.stdin.destroy();
+      finish();
+    });
+
+    restore.on('close', (code) => {
+      restoreCode = code;
+      finish();
     });
 
     dump.on('error', (err) => reject(new Error(`mysqldump error: ${err.message}`)));

@@ -6,7 +6,7 @@ import { Hono } from 'hono';
 import { serve } from '@hono/node-server';
 import { z } from 'zod';
 import { enqueue, getQueueStatus } from './queue.mjs';
-import { devToolsState, startDevOp, copyMediaFiles, syncGeneratedImageDerivatives, createMediaBackupArchive, createDatabaseBackupArchive, listDatabaseBackups, resolveDatabaseBackupArchive, dumpDatabase, flushObjectCache, uploads, db, assertUploadsContract } from './dev-tools.mjs';
+import { devToolsState, startDevOp, readRetention, copyMediaFiles, syncGeneratedImageDerivatives, createMediaBackupArchive, createDatabaseBackupArchive, listDatabaseBackups, resolveDatabaseBackupArchive, dumpDatabase, flushObjectCache, uploads, db, assertUploadsContract } from './dev-tools.mjs';
 import {
   listArchivesForTarget,
   runCommand,
@@ -25,7 +25,6 @@ import {
 const PORT = Number(process.env.ORCHESTRATOR_PORT || 4011);
 const SECRET = process.env.ASTRO_BUILD_TRIGGER_SECRET || '';
 const ALLOW_MANUAL_TRIGGER = process.env.ORCHESTRATOR_ALLOW_MANUAL_TRIGGER !== '0';
-const MAX_BACKUPS = Number(process.env.MAX_BACKUPS || 12);
 const STAGING_SUCCESS_RELEASES_TO_KEEP = Number(process.env.STAGING_SUCCESS_RELEASES_TO_KEEP || 2);
 const STAGING_FAILED_RELEASES_TO_KEEP = Number(process.env.STAGING_FAILED_RELEASES_TO_KEEP || 1);
 
@@ -942,8 +941,10 @@ async function buildJob(target, scope, requestedCommitSha = '', promotionState =
 
   console.log(`[worker] ${target} executing ${DEPLOY_SCRIPT}`);
   const archiveBefore = new Set(listArchivesForTarget(target));
+  const retention = await readRetention();
   const commandEnv = {
     ...process.env,
+    MAX_ROLLBACK_SNAPSHOTS: String(retention.rollbackSnapshots),
     SOURCE_COMMIT_SHA: sourceCommitSha,
   };
   if (promotionState) {
@@ -992,7 +993,7 @@ async function buildJob(target, scope, requestedCommitSha = '', promotionState =
   const releaseId = extractReleaseIdFromArchiveName(target, createdArchive);
   const checksumSha256 = await checksumFileSha256(archivePath);
   console.log(`[worker] ${target} found archive: ${path.basename(archivePath)}`);
-  cleanupOldArchives(target, MAX_BACKUPS);
+  cleanupOldArchives(target, retention.productionArchives);
   updateStatus('backup', target, {
     archivePath,
     sourceCommitSha,

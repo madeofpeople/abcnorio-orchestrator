@@ -9,7 +9,6 @@ process.env.STAGING_UPLOADS_DIR = path.join(tempRoot, 'staging-uploads');
 process.env.DEV_UPLOADS_DIR = path.join(tempRoot, 'dev-uploads');
 process.env.PRODUCTION_UPLOADS_PATH = path.join(tempRoot, 'production-uploads');
 process.env.ASTRO_BUILD_DATABASE_ARCHIVE_DIR = path.join(tempRoot, 'database-backups');
-process.env.MAX_DATABASE_BACKUPS = '2';
 fs.mkdirSync(process.env.STAGING_UPLOADS_DIR, { recursive: true });
 fs.mkdirSync(process.env.DEV_UPLOADS_DIR, { recursive: true });
 fs.mkdirSync(process.env.PRODUCTION_UPLOADS_PATH, { recursive: true });
@@ -163,7 +162,7 @@ test('database backups are created and retained separately for Dev and Staging',
   const archiveDir = process.env.ASTRO_BUILD_DATABASE_ARCHIVE_DIR;
   fs.mkdirSync(archiveDir, { recursive: true });
   const now = Date.now();
-  for (const [env, count] of [['dev', 2], ['staging', 3]]) {
+  for (const [env, count] of [['dev', 4], ['staging', 3]]) {
     for (let index = 0; index < count; index += 1) {
       const name = `abcnorio-database-${env}-20261012-00000${index}.sql`;
       const filePath = path.join(archiveDir, name);
@@ -193,9 +192,8 @@ test('database backups are created and retained separately for Dev and Staging',
 
   assert.match(backupName, /^abcnorio-database-dev-[a-zA-Z0-9_-]+\.sql$/);
   assert.equal(fs.readFileSync(path.join(archiveDir, backupName), 'utf8'), 'fixture SQL\n');
-  assert.equal(listDatabaseBackups('dev').length, 2);
-  assert.equal(listDatabaseBackups('staging').length, 2);
-  assert.equal(fs.readdirSync(archiveDir).filter((name) => name.startsWith('abcnorio-database-staging-')).length, 3);
+  assert.equal(listDatabaseBackups('dev').length, 3);
+  assert.equal(listDatabaseBackups('staging').length, 3);
   assert.equal(resolveDatabaseBackupArchive(backupName, 'dev'), path.join(archiveDir, backupName));
   assert.throws(
     () => resolveDatabaseBackupArchive(backupName, 'staging'),

@@ -152,7 +152,6 @@ curl -X POST http://localhost:4011/restore \
 | `ORCHESTRATOR_PORT` | 4011 | HTTP server port |
 | `ASTRO_BUILD_TRIGGER_SECRET` | (required) | Bearer token for auth |
 | `ORCHESTRATOR_ALLOW_MANUAL_TRIGGER` | 1 | Allow `source=manual` to `/trigger` |
-| `MAX_BACKUPS` | 12 | Archive cleanup threshold per target |
 | `PRODUCTION_HOST` | (none) | Public URL for production HTTP smoke probe (required; production gate fails if unset) |
 | `PREVIEW_HOST` | (none) | Public URL for preview HTTP smoke probe (optional; skipped if unset) |
 | `ORCHESTRATOR_SMOKE_HTTP_TIMEOUT_MS` | 10000 | Timeout in ms for each HTTP smoke probe |
@@ -172,9 +171,9 @@ Tests use `node --test`. Coverage: archive listing, validation, path traversal r
 
 ## Notes
 
-### Max Backups Cleanup
-Cleanup runs after each successful build once the archive is discovered, before `markDone`. 
-`MAX_BACKUPS` determined how many backups are saved.
+### Backup Retention
+Cleanup runs after each successful build or backup, once the new archive exists.
+Retention counts (build archives, rollback snapshots, media backups, database backups) are set in WordPress under Settings > ABC No Rio > Backup retention. The orchestrator reads them from the staging database (`wp_options`) when it prunes, and falls back to 3 for each if unset or unreadable. Names and defaults live in `readRetention` in `dev-tools.mjs` and `BackupRetentionSettings.php` in abcnorio-func.
 
 ### Queue Persistence
 Jobs not yet running are lost on restart. Retriggering is cheap — WP plugin will re-enqueue on next save.
