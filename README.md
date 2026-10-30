@@ -166,11 +166,9 @@ curl -X POST http://localhost:4011/restore \
 
 ## Testing
 
-```bash
-npm test
-```
+`npm test` runs the suite inside the orchestrator image (which has the `mysql` client), not on the host. Requires the image to be built (`docker compose up -d --build deploy-orchestrator` in abcnorio-meta).
 
-Tests use `node --test`. Coverage: archive listing, validation, path traversal rejection, deploy path validation.
+Tests use `node --test`. Coverage: archive listing, validation, path traversal rejection, deploy path validation, `dumpDatabase` error path.
 
 ## Notes
 

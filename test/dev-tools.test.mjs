@@ -19,6 +19,7 @@ const {
   syncGeneratedImageDerivatives,
   startDevOp,
   dumpDatabase,
+  copyDatabase,
   createDatabaseBackupArchive,
   listDatabaseBackups,
   resolveDatabaseBackupArchive,
@@ -138,18 +139,23 @@ test('startDevOp preserves started timestamp across async completion', async () 
   assert.ok(devToolsState.copyMediaToStagingFromDev.finished >= startedAt);
 });
 
-// --- dumpDatabase (error paths only — requires no live DB) ---
+// --- dumpDatabase / copyDatabase (error paths only — requires no live DB, but needs the mysql client) ---
 
-test('dumpDatabase rejects with descriptive error when host is unreachable', async () => {
-  const src = { host: 'nonexistent-db-host-for-testing', name: 'testdb', user: 'nobody', password: 'x' };
-  const dest = { host: 'nonexistent-db-host-for-testing', name: 'testdb', user: 'nobody', password: 'x' };
+test('dumpDatabase fails before copying when the destination is unreachable', async () => {
+  const conn = { host: 'nonexistent-db-host-for-testing', name: 'testdb', user: 'nobody', password: 'x' };
 
   await assert.rejects(
-    () => dumpDatabase(src, dest),
-    (err) => {
-      assert.match(err.message, /mysqldump/);
-      return true;
-    }
+    () => dumpDatabase(conn, conn),
+    /mysql failed: .*nonexistent-db-host-for-testing/
+  );
+});
+
+test('copyDatabase reports mysqldump failure when the source is unreachable', async () => {
+  const conn = { host: 'nonexistent-db-host-for-testing', name: 'testdb', user: 'nobody', password: 'x' };
+
+  await assert.rejects(
+    () => copyDatabase(conn, conn),
+    /mysqldump failed: .*nonexistent-db-host-for-testing/
   );
 });
 

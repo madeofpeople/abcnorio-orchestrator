@@ -90,6 +90,7 @@ export const devToolsState = {
   backupMediaDev: idleDevToolState(),
   backupMediaStaging: idleDevToolState(),
   syncRegeneratedThumbnailsToProduction: idleDevToolState(),
+  backupDatabaseDev: idleDevToolState(),
   backupDatabaseStaging: idleDevToolState(),
 };
 
@@ -405,7 +406,7 @@ export async function dumpDatabase(src, dest) {
   await writePreservedOptions(dest, saved);
 }
 
-function copyDatabase(src, dest) {
+export function copyDatabase(src, dest) {
   return new Promise((resolve, reject) => {
     const dump = spawn('mysqldump', [
       `--host=${src.host}`,

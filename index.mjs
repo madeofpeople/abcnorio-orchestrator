@@ -1409,26 +1409,6 @@ app.get('/dev-tools/database-backups', (c) => {
   return jsonOk(c, 200, { target, backups: listDatabaseBackups(target) });
 });
 
-app.get('/dev-tools/database-backups/download', (c) => {
-  const target = String(c.req.query('target') || '').trim();
-  const file = String(c.req.query('file') || '').trim();
-  if (!isKnownDatabaseBackupTarget(target)) {
-    return jsonError(c, 400, 'invalid_target', 'invalid target', { valid: MEDIA_SYNC_TARGETS });
-  }
-
-  try {
-    const archivePath = resolveDatabaseBackupArchive(file, target);
-    const stat = fs.statSync(archivePath);
-    const stream = fs.createReadStream(archivePath);
-    c.header('Content-Type', 'application/sql');
-    c.header('Content-Disposition', `attachment; filename="${path.basename(archivePath)}"`);
-    c.header('Content-Length', String(stat.size));
-    return c.body(stream, 200);
-  } catch (error) {
-    return jsonError(c, 404, 'archive_not_found', error instanceof Error ? error.message : 'unknown error');
-  }
-});
-
 app.post('/dev-tools/database-backups/delete', async (c) => {
   let parsed;
   try {
@@ -1448,26 +1428,6 @@ app.post('/dev-tools/database-backups/delete', async (c) => {
     return jsonOk(c, 200, { status: 'deleted', target, file });
   } catch (error) {
     return jsonError(c, 404, 'delete_failed', error instanceof Error ? error.message : 'unknown error');
-  }
-});
-
-app.get('/dev-tools/media-backups/download', (c) => {
-  const target = String(c.req.query('target') || '').trim();
-  const file = String(c.req.query('file') || '').trim();
-  if (!isKnownMediaTarget(target)) {
-    return jsonError(c, 400, 'invalid_target', 'invalid target', { valid: MEDIA_SYNC_TARGETS });
-  }
-
-  try {
-    const archivePath = resolveMediaBackupArchive(target, file);
-    const stat = fs.statSync(archivePath);
-    const stream = fs.createReadStream(archivePath);
-    c.header('Content-Type', 'application/zip');
-    c.header('Content-Disposition', `attachment; filename="${path.basename(archivePath)}"`);
-    c.header('Content-Length', String(stat.size));
-    return c.body(stream, 200);
-  } catch (error) {
-    return jsonError(c, 404, 'archive_not_found', error instanceof Error ? error.message : 'unknown error');
   }
 });
 

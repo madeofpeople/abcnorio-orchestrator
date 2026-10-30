@@ -6,6 +6,8 @@ import test from 'node:test';
 
 const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'abcnorio-orchestrator-test-'));
 process.env.ASTRO_SITE_ROOT = tempRoot;
+process.env.ASTRO_BUILD_ARCHIVE_DIR = path.join(tempRoot, 'build-archives');
+delete process.env.ASTRO_BUILD_STATIC_ARCHIVE_DIR;
 
 const {
   assertDeployPath,
