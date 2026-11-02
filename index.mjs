@@ -31,6 +31,7 @@ const STAGING_FAILED_RELEASES_TO_KEEP = Number(process.env.STAGING_FAILED_RELEAS
 const SOURCE_ROOT = process.env.ASTRO_SITE_ROOT || '/astro-site';
 const SOURCE_GIT_ROOT = process.env.ASTRO_SITE_GIT_ROOT || SOURCE_ROOT;
 const SOURCE_GIT_SUBDIR = (process.env.ASTRO_SITE_GIT_SUBDIR || '').replace(/^\/+|\/+$/g, '');
+const DEV_HEALTH_URLS = [process.env.DEV_HEALTH_URL, process.env.DEV_FRONTEND_HEALTH_URL].map((u) => String(u || '').trim());
 const STAGING_HEALTH_URL = String(process.env.STAGING_HEALTH_URL || '').trim();
 const STAGING_FRONTEND_HEALTH_URL = String(process.env.STAGING_FRONTEND_HEALTH_URL || '').trim();
 const STAGING_PLUGIN_VERSION_URL = String(process.env.STAGING_PLUGIN_VERSION_URL || '').trim();
@@ -1389,6 +1390,21 @@ app.get('/releases', (c) => {
 });
 
 app.get('/dev-tools/status', (c) => jsonOk(c, 200, devToolsState));
+
+app.get('/dev-tools/availability', async (c) => {
+  const [cms, frontend] = await Promise.all(DEV_HEALTH_URLS.map(async (url) => {
+    if (!url) {
+      return false;
+    }
+    try {
+      const response = await fetch(url, { signal: AbortSignal.timeout(2000) });
+      return response.ok;
+    } catch {
+      return false;
+    }
+  }));
+  return jsonOk(c, 200, { available: cms && frontend, cms, frontend });
+});
 
 app.get('/dev-tools/media-backups', (c) => {
   const target = String(c.req.query('target') || '').trim();
