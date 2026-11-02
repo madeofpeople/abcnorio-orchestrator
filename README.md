@@ -173,7 +173,7 @@ Tests use `node --test`. Coverage: archive listing, validation, path traversal r
 
 ### Backup Retention
 Cleanup runs after each successful build or backup, once the new archive exists.
-Retention counts (build archives, rollback snapshots, media backups, database backups) are set in WordPress under Settings > ABC No Rio > Backup retention. The orchestrator reads them from the staging database (`wp_options`) when it prunes, and falls back to 3 for each if unset or unreadable. Names and defaults live in `readRetention` in `dev-tools.mjs` and `BackupRetentionSettings.php` in abcnorio-func.
+Retention counts (build archives, rollback snapshots, media backups, database backups) are set in WordPress under Settings > ABC No Rio > Backup retention. The orchestrator reads them from the staging database (`<DB_PREFIX>options`) when it prunes, and falls back to 3 for each if unset or unreadable. Names and defaults live in `readRetention` in `dev-tools.mjs` and `BackupRetentionSettings.php` in abcnorio-func.
 
 ### Queue Persistence
 Jobs not yet running are lost on restart. Retriggering is cheap — WP plugin will re-enqueue on next save.

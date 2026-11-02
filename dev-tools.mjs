@@ -68,12 +68,14 @@ export const db = {
     name: process.env.STAGING_DB_NAME || '',
     user: process.env.STAGING_DB_USER || '',
     password: process.env.STAGING_DB_PASSWORD || '',
+    prefix: process.env.DB_PREFIX,
   },
   dev: {
     host: process.env.DEV_DB_HOST || 'mariadb',
     name: process.env.DEV_DB_NAME || '',
     user: process.env.DEV_DB_USER || '',
     password: process.env.DEV_DB_PASSWORD || '',
+    prefix: process.env.DB_PREFIX,
   },
 };
 
@@ -189,7 +191,7 @@ export async function readRetention() {
 
   const names = Object.keys(RETENTION_OPTIONS).map((n) => `'${n}'`).join(',');
   try {
-    const out = await runMysql(db.staging, `SELECT option_name, option_value FROM wp_options WHERE option_name IN (${names})`);
+    const out = await runMysql(db.staging, `SELECT option_name, option_value FROM ${db.staging.prefix}options WHERE option_name IN (${names})`);
     for (const line of out.split('\n').filter(Boolean)) {
       const [option, value] = line.split('\t');
       const [key] = RETENTION_OPTIONS[option];
@@ -417,15 +419,15 @@ function runMysql(conn, sql) {
 // Values travel as hex so encrypted/binary-ish strings survive the round trip.
 async function readPreservedOptions(conn) {
   const names = PRESERVE_OPTIONS.map((n) => `'${n}'`).join(',');
-  const out = await runMysql(conn, `SELECT option_name, HEX(option_value) FROM wp_options WHERE option_name IN (${names})`);
+  const out = await runMysql(conn, `SELECT option_name, HEX(option_value) FROM ${conn.prefix}options WHERE option_name IN (${names})`);
   return out.split('\n').filter(Boolean).map((line) => line.split('\t'));
 }
 
 async function writePreservedOptions(conn, saved) {
   const names = PRESERVE_OPTIONS.map((n) => `'${n}'`).join(',');
   const inserts = saved.map(([name, hex]) =>
-    `INSERT INTO wp_options (option_name, option_value, autoload) VALUES ('${name}', UNHEX('${hex}'), 'no')`);
-  await runMysql(conn, [`DELETE FROM wp_options WHERE option_name IN (${names})`, ...inserts].join('; '));
+    `INSERT INTO ${conn.prefix}options (option_name, option_value, autoload) VALUES ('${name}', UNHEX('${hex}'), 'no')`);
+  await runMysql(conn, [`DELETE FROM ${conn.prefix}options WHERE option_name IN (${names})`, ...inserts].join('; '));
 }
 
 export async function dumpDatabase(src, dest) {
