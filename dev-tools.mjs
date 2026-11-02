@@ -388,6 +388,9 @@ const PRESERVE_OPTIONS = [
   'mailchimp_sf_auth_error',
   'mc_datacenter',
   'mc_api_key',
+  // FluentSMTP credentials are encrypted with each site's salts, so they can't be copied between envs.
+  'fluentmail-settings',
+  '_fluentsmtp_connection_health',
   'abcnorio_retention_production_archives',
   'abcnorio_retention_rollback_snapshots',
   'abcnorio_retention_media_backups',
