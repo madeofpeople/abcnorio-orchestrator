@@ -152,6 +152,8 @@ curl -X POST http://localhost:4011/restore \
 | `ORCHESTRATOR_PORT` | 4011 | HTTP server port |
 | `ASTRO_BUILD_TRIGGER_SECRET` | (required) | Bearer token for auth |
 | `ORCHESTRATOR_ALLOW_MANUAL_TRIGGER` | 1 | Allow `source=manual` to `/trigger` |
+| `DEV_HEALTH_URL` | (none) | Dev CMS URL probed by `GET /dev-tools/availability` |
+| `DEV_FRONTEND_HEALTH_URL` | (none) | Dev frontend URL probed by `GET /dev-tools/availability`; the WP Deployment page hides the Dev tab unless both respond |
 | `PRODUCTION_HOST` | (none) | Public URL for production HTTP smoke probe (required; production gate fails if unset) |
 | `PREVIEW_HOST` | (none) | Public URL for preview HTTP smoke probe (optional; skipped if unset) |
 | `ORCHESTRATOR_SMOKE_HTTP_TIMEOUT_MS` | 10000 | Timeout in ms for each HTTP smoke probe |
@@ -160,7 +162,7 @@ curl -X POST http://localhost:4011/restore \
 | `ASTRO_SITE_ROOT` | /astro-site | Astro source directory (mount) |
 | `ASTRO_BUILD_WORKDIR` | ASTRO_SITE_ROOT | Writable build scratch/work directory |
 | `ASTRO_STAGING_SITE_ROOT` | "" | Legacy compatibility knob; single-source runtime keeps staging generated from the same source tree |
-| `ASTRO_DEPLOYMENT_STATUS_FILE` | (none) | Override status file path |
+| `ASTRO_DEPLOYMENT_STATUS_FILE` | `<ASTRO_BUILD_ARCHIVE_DIR>/deployment-status.json` | Optional override, used by tests. Leave unset: the WP plugin derives the same path from `ASTRO_BUILD_ARCHIVE_DIR`, so an override would hide the status from it |
 | `ORCHESTRATOR_SCRIPT_ROOT` | /orchestrator/scripts | Deploy script location |
 
 ## Testing
