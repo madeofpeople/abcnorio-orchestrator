@@ -6,7 +6,7 @@ import { Hono } from 'hono';
 import { serve } from '@hono/node-server';
 import { z } from 'zod';
 import { enqueue, getQueueStatus } from './queue.mjs';
-import { devToolsState, startDevOp, readRetention, copyMediaFiles, syncGeneratedImageDerivatives, createMediaBackupArchive, createDatabaseBackupArchive, listDatabaseBackups, resolveDatabaseBackupArchive, dumpDatabase, uploads, db, assertUploadsContract } from './dev-tools.mjs';
+import { devToolsState, startDevOp, readRetention, copyMediaFiles, syncGeneratedImageDerivatives, createMediaBackupArchive, createDatabaseBackupArchive, listDatabaseBackups, resolveDatabaseBackupArchive, dumpDatabase, normalizeUrls, uploads, db, assertUploadsContract } from './dev-tools.mjs';
 import {
   listArchivesForTarget,
   runCommand,
@@ -698,7 +698,8 @@ const DEV_OPS = {
     run: async () => {
       await copyMediaFiles(uploads.dev, uploads.staging);
       await dumpDatabase(db.dev, db.staging);
-      return 'Dev data pulled to staging.';
+      const rewritten = await normalizeUrls(STAGING_HEALTH_URL, SECRET, 'staging');
+      return `Dev data pulled to staging. ${rewritten} rows URL-normalized.`;
     },
   },
   '/dev-tools/pull-from-staging': {
@@ -708,7 +709,8 @@ const DEV_OPS = {
     run: async () => {
       await copyMediaFiles(uploads.staging, uploads.dev);
       await dumpDatabase(db.staging, db.dev);
-      return 'Staging data pulled to dev.';
+      const rewritten = await normalizeUrls(DEV_HEALTH_URLS[0], SECRET, 'dev');
+      return `Staging data pulled to dev. ${rewritten} rows URL-normalized.`;
     },
   },
   '/dev-tools/push-to-staging': () => ({

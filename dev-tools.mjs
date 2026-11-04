@@ -434,6 +434,28 @@ export async function dumpDatabase(src, dest) {
   await writePreservedOptions(dest, saved);
 }
 
+// Rewrites other environments' hosts in the freshly copied content. Required after every DB copy.
+export async function normalizeUrls(wpHealthUrl, secret, envName) {
+  if (!wpHealthUrl) throw new Error(`No ${envName} WP health URL configured; cannot normalize URLs.`);
+  const url = new URL('/wp-json/abcnorio/v1/normalize-urls', wpHealthUrl);
+  let res;
+  try {
+    res = await fetch(url, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${secret}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ apply: true }),
+      signal: AbortSignal.timeout(300_000),
+    });
+  } catch (err) {
+    throw new Error(`Database copied but URL normalization could not reach ${envName} WP (${err.message}). Start it, then run: just rewrite-hosts ${envName} apply`);
+  }
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(`Database copied but URL normalization failed on ${envName} (${res.status}: ${body.message || 'no message'}). Run: just rewrite-hosts ${envName} apply`);
+  }
+  return body.rows_changed;
+}
+
 export function copyDatabase(src, dest) {
   return new Promise((resolve, reject) => {
     const dump = spawn('mysqldump', [
