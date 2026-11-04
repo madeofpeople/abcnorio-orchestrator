@@ -171,11 +171,6 @@ export async function syncGeneratedImageDerivatives(src, dest) {
   return { copiedFiles, copiedBytes };
 }
 
-// object-cache.php purges this site's APCu entries when this marker changes.
-export function flushObjectCache(uploadsDir) {
-  fs.writeFileSync(path.join(uploadsDir, '.object-cache-namespace'), String(Date.now()), { mode: 0o664 });
-}
-
 // Keep names and defaults in sync with BackupRetentionSettings.php in abcnorio-func.
 const RETENTION_OPTIONS = {
   abcnorio_retention_production_archives: ['productionArchives', 3],
