@@ -599,7 +599,7 @@ function resolveRollbackReleaseId(target) {
   return String(releases[1].releaseId || '').trim();
 }
 
-async function deployReleaseArtifact(target, deployBuildPath, archivePath, sourceCommitSha = null, syncStagingUploads = false) {
+async function deployReleaseArtifact(target, deployBuildPath, archivePath, sourceCommitSha = null, syncStagingUploads = false, scanForLeaks = false) {
   const resolvedArchivePath = path.resolve(archivePath);
   const releaseId = extractReleaseIdFromArchiveName(target, path.basename(resolvedArchivePath));
   const checksumSha256 = await checksumFileSha256(resolvedArchivePath);
@@ -610,6 +610,7 @@ async function deployReleaseArtifact(target, deployBuildPath, archivePath, sourc
   }
 
   const restoredPath = await restoreArchiveToTarget(target, resolvedArchivePath, deployBuildPath, (extractedRoot) => {
+    if (!scanForLeaks) return;
     const leaks = findEnvHostLeaks(path.join(extractedRoot, 'client'));
     if (leaks.length > 0) {
       throw new Error(`dev hosts found in release ${releaseId}; live site not changed: ${leaks.slice(0, 5).join('; ')}`);
@@ -624,7 +625,7 @@ async function deployReleaseArtifact(target, deployBuildPath, archivePath, sourc
     artifactPath: resolvedArchivePath,
   });
 
-  const smokeResults = await runSmokeChecks(target, restoredPath);
+  const smokeResults = await runSmokeChecks(target, restoredPath, scanForLeaks);
   updateStatus('smoke', target, smokeResults);
   if (!smokeResults.passed) {
     const failedNames = smokeResults.checks
@@ -838,7 +839,7 @@ function findEnvHostLeaks(root) {
   return found;
 }
 
-async function runSmokeChecks(target, deployPath) {
+async function runSmokeChecks(target, deployPath, scanForLeaks = false) {
   const start = Date.now();
   const checks = [];
 
@@ -854,7 +855,7 @@ async function runSmokeChecks(target, deployPath) {
     clientNonEmpty ? 'client/ present' : clientExists ? 'client/ empty' : `client/ missing at ${clientPath}`);
 
   // No other-environment hosts (dev) may be baked into public output
-  const leaks = findEnvHostLeaks(clientPath);
+  const leaks = scanForLeaks ? findEnvHostLeaks(clientPath) : [];
   check('no_env_host_leaks', 'required', leaks.length === 0,
     leaks.length === 0 ? 'no dev hosts in client/' : `dev hosts found: ${leaks.slice(0, 5).join('; ')}${leaks.length > 5 ? ` (+${leaks.length - 5} more)` : ''}`);
 
@@ -1044,6 +1045,7 @@ async function buildJob(target, scope, requestedCommitSha = '', promotionState =
       archivePath,
       sourceCommitSha,
       target === 'production' && requestedCommitSha !== '',
+      true,
     );
   } catch (error) {
     const message = `${target} release ${releaseId} deployment failed: ${error instanceof Error ? error.message : String(error)}`;

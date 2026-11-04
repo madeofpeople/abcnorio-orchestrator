@@ -282,3 +282,21 @@ test('promotion with a dev host in client/ fails and leaves live Production unto
   assert.equal(fs.existsSync(path.join(fixture.productionPath, 'client/index.html')), false);
   assert.equal(fs.readFileSync(path.join(fixture.productionPath, '.ssr/server/old.mjs'), 'utf8'), 'old server');
 });
+
+test('rollback to a release containing a dev host still restores it', async (t) => {
+  const fixture = await createPromotionFixture({ leakHost: 'abcwpdev.example.test' });
+  t.after(fixture.stop);
+
+  fs.writeFileSync(path.join(fixture.staticArchiveDir, 'abcnorio-astro-production-old-leaky.zip'), 'archive');
+  const auth = { authorization: `Bearer ${secret}` };
+
+  const response = await fetch(fixture.healthUrl.replace('/health', '/rollback'), {
+    method: 'POST',
+    headers: { ...auth, 'content-type': 'application/json' },
+    body: JSON.stringify({ target: 'production', release_id: 'old-leaky' }),
+  });
+
+  assert.equal(response.status, 200, await response.clone().text());
+  assert.equal((await response.json()).data.status, 'rolled_back');
+  assert.match(fs.readFileSync(path.join(fixture.productionPath, 'client/index.html'), 'utf8'), /abcwpdev\.example\.test/);
+});
