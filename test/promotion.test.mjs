@@ -33,7 +33,7 @@ function closeServer(server) {
   return new Promise((resolve) => server.close(resolve));
 }
 
-async function createPromotionFixture() {
+async function createPromotionFixture({ leakHost = null } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'astro-promotion-test-'));
   const sourceRoot = path.join(root, 'source');
   const gitRoot = path.join(root, 'git');
@@ -81,7 +81,7 @@ async function createPromotionFixture() {
   writeJson(path.join(stagingRoot, '.staging-provenance.json'), { sourceCommitSha });
 
   for (const [relativePath, content] of [
-    ['client/index.html', 'new client'],
+    ['client/index.html', leakHost ? `<form action="https://${leakHost}/wp-json/x">` : 'new client'],
     ['.ssr/server/entry.mjs', 'new server'],
     ['.ssr/client/entry.js', 'new SSR client'],
     ['.ssr/.deploy-version', 'promotion-fixture'],
@@ -153,6 +153,7 @@ cp -R "$TEST_EXTRACT_ROOT/." "$destination/"
     PRODUCTION_BUILD_PATH: productionPath,
     PREVIEW_BUILD_PATH: path.join(root, 'preview-output'),
     PRODUCTION_HOST: baseUrl,
+    ENV_LEAK_HOSTS: 'abcwpdev.example.test,dev.example.test',
     STAGING_HEALTH_URL: `${baseUrl}/cms-health`,
     STAGING_FRONTEND_HEALTH_URL: `${baseUrl}/frontend-health`,
     STAGING_PLUGIN_VERSION_URL: `${baseUrl}/plugin-version`,
@@ -252,4 +253,32 @@ test('promote-staging completes a Production promotion from verified Staging', a
   const deploymentStatus = JSON.parse(fs.readFileSync(fixture.statusFile, 'utf8'));
   assert.equal(deploymentStatus.envs.production.lastStatus, 'done');
   assert.equal(deploymentStatus.envs.production.lastError, null);
+});
+test('promotion with a dev host in client/ fails and leaves live Production untouched', async (t) => {
+  const fixture = await createPromotionFixture({ leakHost: 'abcwpdev.example.test' });
+  t.after(fixture.stop);
+
+  const auth = { authorization: `Bearer ${secret}` };
+  const accepted = await fetch(fixture.healthUrl.replace('/health', '/promote-staging'), {
+    method: 'POST',
+    headers: { ...auth, 'content-type': 'application/json' },
+    body: '{}',
+  });
+  assert.equal(accepted.status, 202);
+
+  const statusUrl = fixture.healthUrl.replace('/health', '/status');
+  const deadline = Date.now() + 10000;
+  let runtime;
+  while (Date.now() < deadline) {
+    const response = await fetch(statusUrl, { headers: auth });
+    runtime = (await response.json()).data;
+    if (runtime.status === 'done' || runtime.status === 'failed') break;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+
+  assert.equal(runtime?.status, 'failed');
+  assert.match(runtime.message, /dev hosts found.*live site not changed/);
+  assert.equal(fs.readFileSync(path.join(fixture.productionPath, 'client/old.html'), 'utf8'), 'old client');
+  assert.equal(fs.existsSync(path.join(fixture.productionPath, 'client/index.html')), false);
+  assert.equal(fs.readFileSync(path.join(fixture.productionPath, '.ssr/server/old.mjs'), 'utf8'), 'old server');
 });

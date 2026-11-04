@@ -609,7 +609,12 @@ async function deployReleaseArtifact(target, deployBuildPath, archivePath, sourc
     throw new Error(`artifact checksum mismatch for release_id=${releaseId}`);
   }
 
-  const restoredPath = await restoreArchiveToTarget(target, resolvedArchivePath, deployBuildPath);
+  const restoredPath = await restoreArchiveToTarget(target, resolvedArchivePath, deployBuildPath, (extractedRoot) => {
+    const leaks = findEnvHostLeaks(path.join(extractedRoot, 'client'));
+    if (leaks.length > 0) {
+      throw new Error(`dev hosts found in release ${releaseId}; live site not changed: ${leaks.slice(0, 5).join('; ')}`);
+    }
+  });
 
   updateStatus('deploy', target, {
     deployBuildPath: restoredPath,
@@ -808,6 +813,31 @@ if (!Object.values(TARGETS).some(Boolean)) {
   process.exit(1);
 }
 
+const ENV_LEAK_HOSTS = String(process.env.ENV_LEAK_HOSTS || '').split(',').map((h) => h.trim()).filter(Boolean);
+const LEAK_FILE_EXT = new Set(['.html', '.js', '.mjs', '.json', '.css', '.xml', '.txt']);
+
+// Returns "file: host" for each public file that contains a leak host as a whole hostname
+function findEnvHostLeaks(root) {
+  if (ENV_LEAK_HOSTS.length === 0) {
+    throw new Error('ENV_LEAK_HOSTS is not set; refusing to deploy without the leak scan');
+  }
+  const escaped = ENV_LEAK_HOSTS.map((h) => h.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  const pattern = new RegExp(`(?<![A-Za-z0-9-])(${escaped.join('|')})(?![A-Za-z0-9-])`);
+  const found = [];
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (LEAK_FILE_EXT.has(path.extname(entry.name))) {
+        const match = pattern.exec(fs.readFileSync(full, 'utf8'));
+        if (match) found.push(`${path.relative(root, full)}: ${match[1]}`);
+      }
+    }
+  };
+  if (fs.existsSync(root)) walk(root);
+  return found;
+}
+
 async function runSmokeChecks(target, deployPath) {
   const start = Date.now();
   const checks = [];
@@ -822,6 +852,11 @@ async function runSmokeChecks(target, deployPath) {
   const clientNonEmpty = clientExists && fs.readdirSync(clientPath).some(e => e !== '.' && e !== '..');
   check('client_build_exists', 'required', clientNonEmpty,
     clientNonEmpty ? 'client/ present' : clientExists ? 'client/ empty' : `client/ missing at ${clientPath}`);
+
+  // No other-environment hosts (dev) may be baked into public output
+  const leaks = findEnvHostLeaks(clientPath);
+  check('no_env_host_leaks', 'required', leaks.length === 0,
+    leaks.length === 0 ? 'no dev hosts in client/' : `dev hosts found: ${leaks.slice(0, 5).join('; ')}${leaks.length > 5 ? ` (+${leaks.length - 5} more)` : ''}`);
 
   // Production-only: SSR runtime structure
   if (target === 'production') {

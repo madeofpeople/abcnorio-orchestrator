@@ -86,7 +86,7 @@ export function runCommand(command, args, env = process.env) {
   });
 }
 
-export async function restoreArchiveToTarget(target, archivePath, deployBuildPath) {
+export async function restoreArchiveToTarget(target, archivePath, deployBuildPath, beforeSwap = null) {
   const resolvedDeployPath = assertDeployPath(target, deployBuildPath);
   const expectedRootName = path.basename(resolvedDeployPath);
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'abcnorio-restore-'));
@@ -107,6 +107,10 @@ export async function restoreArchiveToTarget(target, archivePath, deployBuildPat
       throw new Error(`invalid archive root: expected ${expectedRootName}, got ${extractedRootEntry.name}`);
     }
     const extractedRoot = path.join(tmpDir, extractedRootEntry.name);
+    // Runs before live files are removed; throwing here leaves the live site untouched
+    if (beforeSwap) {
+      beforeSwap(extractedRoot);
+    }
 
     const entries = fs.readdirSync(resolvedDeployPath, { withFileTypes: true });
     for (const entry of entries) {

@@ -13,6 +13,7 @@ const {
   assertDeployPath,
   resolveArchiveForTarget,
   listArchivesForTarget,
+  restoreArchiveToTarget,
 } = await import('../files.mjs');
 
 const archiveDir = path.join(tempRoot, 'build-archives', 'static-backup');
@@ -97,4 +98,27 @@ test('assertDeployPath throws for missing directory', () => {
     () => assertDeployPath('production', path.join(tempRoot, 'missing-deploy-dir')),
     /deploy path not found/
   );
+});
+
+test('restoreArchiveToTarget leaves live files untouched when beforeSwap throws', async () => {
+  const base = fs.mkdtempSync(path.join(tempRoot, 'restore-'));
+  const live = path.join(base, 'prod');
+  fs.mkdirSync(path.join(live, 'client'), { recursive: true });
+  fs.writeFileSync(path.join(live, 'client', 'index.html'), 'live');
+
+  const staged = path.join(base, 'stage', 'prod');
+  fs.mkdirSync(path.join(staged, 'client'), { recursive: true });
+  fs.writeFileSync(path.join(staged, 'client', 'index.html'), 'new');
+  const zip = path.join(base, 'prod.zip');
+  const { execFileSync } = await import('node:child_process');
+  execFileSync('zip', ['-qr', zip, 'prod'], { cwd: path.join(base, 'stage') });
+
+  await assert.rejects(
+    restoreArchiveToTarget('preview', zip, live, () => { throw new Error('leak'); }),
+    /leak/,
+  );
+  assert.equal(fs.readFileSync(path.join(live, 'client', 'index.html'), 'utf8'), 'live');
+
+  await restoreArchiveToTarget('preview', zip, live, () => {});
+  assert.equal(fs.readFileSync(path.join(live, 'client', 'index.html'), 'utf8'), 'new');
 });
