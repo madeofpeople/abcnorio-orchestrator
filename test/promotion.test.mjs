@@ -33,7 +33,7 @@ function closeServer(server) {
   return new Promise((resolve) => server.close(resolve));
 }
 
-async function createPromotionFixture({ leakHost = null } = {}) {
+async function createPromotionFixture({ leakHost = null, uploadsLeak = false } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'astro-promotion-test-'));
   const sourceRoot = path.join(root, 'source');
   const gitRoot = path.join(root, 'git');
@@ -46,16 +46,25 @@ async function createPromotionFixture({ leakHost = null } = {}) {
   const binRoot = path.join(root, 'bin');
   const stagingUploads = path.join(root, 'staging-uploads');
   const devUploads = path.join(root, 'dev-uploads');
+  const productionUploads = path.join(root, 'production-uploads');
   const statusFile = path.join(root, 'deployment-status.json');
   const extractRoot = path.join(root, 'extract', path.basename(productionPath));
 
   for (const dir of [sourceRoot, gitRoot, workdir, stagingRoot, staticArchiveDir, productionPath, scriptsRoot, binRoot]) {
     fs.mkdirSync(dir, { recursive: true });
   }
-  for (const uploadsPath of [stagingUploads, devUploads]) {
+  for (const uploadsPath of [stagingUploads, devUploads, productionUploads]) {
     fs.mkdirSync(uploadsPath, { recursive: true });
     fs.chmodSync(uploadsPath, 0o2770);
   }
+
+  fs.mkdirSync(path.join(stagingUploads, '2026'), { recursive: true });
+  fs.mkdirSync(path.join(productionUploads, '2026'), { recursive: true });
+  fs.writeFileSync(path.join(stagingUploads, '2026/new.webp'), 'new image');
+  fs.writeFileSync(path.join(stagingUploads, '2026/changed.webp'), 'changed v2');
+  fs.writeFileSync(path.join(stagingUploads, '.object-cache-namespace'), '1');
+  fs.writeFileSync(path.join(productionUploads, '2026/changed.webp'), 'changed v1');
+  fs.writeFileSync(path.join(productionUploads, '2026/only-prod.webp'), 'keep me');
 
   const lock = {
     lockfileVersion: 3,
@@ -85,6 +94,7 @@ async function createPromotionFixture({ leakHost = null } = {}) {
     ['.ssr/server/entry.mjs', 'new server'],
     ['.ssr/client/entry.js', 'new SSR client'],
     ['.ssr/.deploy-version', 'promotion-fixture'],
+    ...(uploadsLeak ? [['.ssr/server/chunks/data.mjs', 'src=\\"https://abcwpstaging.example.test/app/uploads/2026/a.webp']] : []),
   ]) {
     const filePath = path.join(extractRoot, relativePath);
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
@@ -154,11 +164,13 @@ cp -R "$TEST_EXTRACT_ROOT/." "$destination/"
     PREVIEW_BUILD_PATH: path.join(root, 'preview-output'),
     PRODUCTION_HOST: baseUrl,
     ENV_LEAK_HOSTS: 'abcwpdev.example.test,dev.example.test',
+    UPLOADS_LEAK_HOST: 'abcwpstaging.example.test',
     STAGING_HEALTH_URL: `${baseUrl}/cms-health`,
     STAGING_FRONTEND_HEALTH_URL: `${baseUrl}/frontend-health`,
     STAGING_PLUGIN_VERSION_URL: `${baseUrl}/plugin-version`,
     STAGING_UPLOADS_DIR: stagingUploads,
     DEV_UPLOADS_DIR: devUploads,
+    PRODUCTION_UPLOADS_PATH: productionUploads,
     PROJECT_UID: String(process.getuid()),
     PROJECT_GID: String(gid),
     TEST_EXTRACT_ROOT: extractRoot,
@@ -211,7 +223,7 @@ cp -R "$TEST_EXTRACT_ROOT/." "$destination/"
     }
     try {
       const response = await fetch(healthUrl);
-      if (response.ok) return { root, child, env, sourceCommitSha, statusFile, staticArchiveDir, productionPath, healthUrl, stop, stderr: () => stderr };
+      if (response.ok) return { root, child, env, sourceCommitSha, statusFile, staticArchiveDir, productionPath, productionUploads, healthUrl, stop, stderr: () => stderr };
     } catch {}
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
@@ -253,6 +265,10 @@ test('promote-staging completes a Production promotion from verified Staging', a
   const deploymentStatus = JSON.parse(fs.readFileSync(fixture.statusFile, 'utf8'));
   assert.equal(deploymentStatus.envs.production.lastStatus, 'done');
   assert.equal(deploymentStatus.envs.production.lastError, null);
+  assert.equal(fs.readFileSync(path.join(fixture.productionUploads, '2026/new.webp'), 'utf8'), 'new image');
+  assert.equal(fs.readFileSync(path.join(fixture.productionUploads, '2026/changed.webp'), 'utf8'), 'changed v2');
+  assert.equal(fs.readFileSync(path.join(fixture.productionUploads, '2026/only-prod.webp'), 'utf8'), 'keep me');
+  assert.equal(fs.existsSync(path.join(fixture.productionUploads, '.object-cache-namespace')), false);
 });
 test('promotion with a dev host in client/ fails and leaves live Production untouched', async (t) => {
   const fixture = await createPromotionFixture({ leakHost: 'abcwpdev.example.test' });
@@ -278,6 +294,35 @@ test('promotion with a dev host in client/ fails and leaves live Production unto
 
   assert.equal(runtime?.status, 'failed');
   assert.match(runtime.message, /dev hosts found.*live site not changed/);
+  assert.equal(fs.readFileSync(path.join(fixture.productionPath, 'client/old.html'), 'utf8'), 'old client');
+  assert.equal(fs.existsSync(path.join(fixture.productionPath, 'client/index.html')), false);
+  assert.equal(fs.readFileSync(path.join(fixture.productionPath, '.ssr/server/old.mjs'), 'utf8'), 'old server');
+});
+
+test('promotion with a staging upload URL in the SSR data layer fails and leaves live Production untouched', async (t) => {
+  const fixture = await createPromotionFixture({ uploadsLeak: true });
+  t.after(fixture.stop);
+
+  const auth = { authorization: `Bearer ${secret}` };
+  const accepted = await fetch(fixture.healthUrl.replace('/health', '/promote-staging'), {
+    method: 'POST',
+    headers: { ...auth, 'content-type': 'application/json' },
+    body: '{}',
+  });
+  assert.equal(accepted.status, 202);
+
+  const statusUrl = fixture.healthUrl.replace('/health', '/status');
+  const deadline = Date.now() + 10000;
+  let runtime;
+  while (Date.now() < deadline) {
+    const response = await fetch(statusUrl, { headers: auth });
+    runtime = (await response.json()).data;
+    if (runtime.status === 'done' || runtime.status === 'failed') break;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+
+  assert.equal(runtime?.status, 'failed');
+  assert.match(runtime.message, /staging upload URLs found.*live site not changed/);
   assert.equal(fs.readFileSync(path.join(fixture.productionPath, 'client/old.html'), 'utf8'), 'old client');
   assert.equal(fs.existsSync(path.join(fixture.productionPath, 'client/index.html')), false);
   assert.equal(fs.readFileSync(path.join(fixture.productionPath, '.ssr/server/old.mjs'), 'utf8'), 'old server');

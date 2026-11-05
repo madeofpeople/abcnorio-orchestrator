@@ -552,17 +552,16 @@ async function readStagingPluginVersion() {
   return version;
 }
 
-async function finishProductionDeploy(syncStagingUploads = false) {
-  const productionUploadsPath = String(process.env.PRODUCTION_UPLOADS_PATH || '').trim();
-  if (syncStagingUploads && productionUploadsPath && fs.existsSync(uploads.staging)) {
-    await fs.promises.mkdir(productionUploadsPath, { recursive: true });
-    await fs.promises.cp(uploads.staging, productionUploadsPath, {
-      recursive: true,
-      force: false,
-      errorOnExist: false,
-    });
-  }
+// Additive on purpose (no --delete): a purge in staging must never remove media production serves.
+async function syncStagingUploadsToStore() {
+  const storePath = String(process.env.PRODUCTION_UPLOADS_PATH || '').trim();
+  if (!storePath) throw new Error('PRODUCTION_UPLOADS_PATH is not configured');
+  const args = ['-rtc', '--exclude=.object-cache-namespace', '--exclude=.htaccess', '--exclude=.DS_Store', '--chmod=D2775,F664', `${uploads.staging}/`, `${storePath}/`];
+  const exitCode = await runCommand('rsync', args, process.env);
+  if (exitCode !== 0) throw new Error(`uploads rsync failed with exit ${exitCode}`);
+}
 
+async function finishProductionDeploy() {
   const warmCacheScript = path.join(SCRIPT_ROOT, 'warm-cache.sh');
   const warmCacheExitCode = await runCommand('bash', [warmCacheScript], process.env);
   if (warmCacheExitCode !== 0) {
@@ -609,11 +608,19 @@ async function deployReleaseArtifact(target, deployBuildPath, archivePath, sourc
     throw new Error(`artifact checksum mismatch for release_id=${releaseId}`);
   }
 
+  if (syncStagingUploads) {
+    await syncStagingUploadsToStore();
+  }
+
   const restoredPath = await restoreArchiveToTarget(target, resolvedArchivePath, deployBuildPath, (extractedRoot) => {
     if (!scanForLeaks) return;
     const leaks = findEnvHostLeaks(path.join(extractedRoot, 'client'));
     if (leaks.length > 0) {
       throw new Error(`dev hosts found in release ${releaseId}; live site not changed: ${leaks.slice(0, 5).join('; ')}`);
+    }
+    const uploadLeaks = findUploadHostLeaks(extractedRoot);
+    if (uploadLeaks.length > 0) {
+      throw new Error(`staging upload URLs found in release ${releaseId}; live site not changed: ${uploadLeaks.slice(0, 5).join('; ')}`);
     }
   });
 
@@ -636,7 +643,7 @@ async function deployReleaseArtifact(target, deployBuildPath, archivePath, sourc
   }
 
   if (target === 'production') {
-    await finishProductionDeploy(syncStagingUploads);
+    await finishProductionDeploy();
   }
 
   return {
@@ -815,15 +822,12 @@ if (!Object.values(TARGETS).some(Boolean)) {
 }
 
 const ENV_LEAK_HOSTS = String(process.env.ENV_LEAK_HOSTS || '').split(',').map((h) => h.trim()).filter(Boolean);
+// Static builds must serve uploads from their own domain, never the staging WP host.
+const UPLOADS_LEAK_HOST = String(process.env.UPLOADS_LEAK_HOST || '').trim();
 const LEAK_FILE_EXT = new Set(['.html', '.js', '.mjs', '.json', '.css', '.xml', '.txt']);
 
-// Returns "file: host" for each public file that contains a leak host as a whole hostname
-function findEnvHostLeaks(root) {
-  if (ENV_LEAK_HOSTS.length === 0) {
-    throw new Error('ENV_LEAK_HOSTS is not set; refusing to deploy without the leak scan');
-  }
-  const escaped = ENV_LEAK_HOSTS.map((h) => h.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
-  const pattern = new RegExp(`(?<![A-Za-z0-9-])(${escaped.join('|')})(?![A-Za-z0-9-])`);
+// Returns "file: match" for each text file under root that matches the pattern
+function scanFilesForPattern(root, pattern) {
   const found = [];
   const walk = (dir) => {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -831,12 +835,34 @@ function findEnvHostLeaks(root) {
       if (entry.isDirectory()) walk(full);
       else if (LEAK_FILE_EXT.has(path.extname(entry.name))) {
         const match = pattern.exec(fs.readFileSync(full, 'utf8'));
-        if (match) found.push(`${path.relative(root, full)}: ${match[1]}`);
+        if (match) found.push(`${path.relative(root, full)}: ${match[0]}`);
       }
     }
   };
   if (fs.existsSync(root)) walk(root);
   return found;
+}
+
+const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+function findEnvHostLeaks(root) {
+  if (ENV_LEAK_HOSTS.length === 0) {
+    throw new Error('ENV_LEAK_HOSTS is not set; refusing to deploy without the leak scan');
+  }
+  const hosts = ENV_LEAK_HOSTS.map(escapeRegex).join('|');
+  return scanFilesForPattern(root, new RegExp(`(?<![A-Za-z0-9-])(?:${hosts})(?![A-Za-z0-9-])`));
+}
+
+// Matches plain and JSON-escaped (\/) slashes; covers client/ and the SSR data layer.
+function findUploadHostLeaks(releaseRoot) {
+  if (!UPLOADS_LEAK_HOST) {
+    throw new Error('UPLOADS_LEAK_HOST is not set; refusing to deploy without the uploads scan');
+  }
+  const pattern = new RegExp(`${escapeRegex(UPLOADS_LEAK_HOST)}(?:\\\\?/)app(?:\\\\?/)uploads`);
+  return [
+    ...scanFilesForPattern(path.join(releaseRoot, 'client'), pattern),
+    ...scanFilesForPattern(path.join(releaseRoot, '.ssr/server'), pattern),
+  ];
 }
 
 async function runSmokeChecks(target, deployPath, scanForLeaks = false) {
@@ -858,6 +884,10 @@ async function runSmokeChecks(target, deployPath, scanForLeaks = false) {
   const leaks = scanForLeaks ? findEnvHostLeaks(clientPath) : [];
   check('no_env_host_leaks', 'required', leaks.length === 0,
     leaks.length === 0 ? 'no dev hosts in client/' : `dev hosts found: ${leaks.slice(0, 5).join('; ')}${leaks.length > 5 ? ` (+${leaks.length - 5} more)` : ''}`);
+
+  const uploadLeaks = scanForLeaks ? findUploadHostLeaks(deployPath) : [];
+  check('no_staging_upload_urls', 'required', uploadLeaks.length === 0,
+    uploadLeaks.length === 0 ? 'no staging upload URLs in client/ or .ssr/server' : `staging upload URLs found: ${uploadLeaks.slice(0, 5).join('; ')}${uploadLeaks.length > 5 ? ` (+${uploadLeaks.length - 5} more)` : ''}`);
 
   // Production-only: SSR runtime structure
   if (target === 'production') {
@@ -1044,7 +1074,7 @@ async function buildJob(target, scope, requestedCommitSha = '', promotionState =
       resolvedDeployPath,
       archivePath,
       sourceCommitSha,
-      target === 'production' && requestedCommitSha !== '',
+      true,
       true,
     );
   } catch (error) {
