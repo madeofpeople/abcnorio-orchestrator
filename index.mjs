@@ -821,9 +821,9 @@ if (!Object.values(TARGETS).some(Boolean)) {
   process.exit(1);
 }
 
-const ENV_LEAK_HOSTS = String(process.env.ENV_LEAK_HOSTS || '').split(',').map((h) => h.trim()).filter(Boolean);
-// Static builds must serve uploads from their own domain, never the staging WP host.
-const UPLOADS_LEAK_HOST = String(process.env.UPLOADS_LEAK_HOST || '').trim();
+const { DOMAIN_WP_DEV, DOMAIN_DEV, DOMAIN_WP_STAGING } = process.env;
+// Hosts of other environments must not appear in public output.
+const OTHER_ENV_HOSTS = [DOMAIN_WP_DEV, DOMAIN_DEV].filter(Boolean);
 const LEAK_FILE_EXT = new Set(['.html', '.js', '.mjs', '.json', '.css', '.xml', '.txt']);
 
 // Returns "file: match" for each text file under root that matches the pattern
@@ -846,19 +846,19 @@ function scanFilesForPattern(root, pattern) {
 const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 function findEnvHostLeaks(root) {
-  if (ENV_LEAK_HOSTS.length === 0) {
-    throw new Error('ENV_LEAK_HOSTS is not set; refusing to deploy without the leak scan');
+  if (OTHER_ENV_HOSTS.length === 0) {
+    throw new Error('DOMAIN_WP_DEV and DOMAIN_DEV are not set; refusing to deploy without the leak scan');
   }
-  const hosts = ENV_LEAK_HOSTS.map(escapeRegex).join('|');
+  const hosts = OTHER_ENV_HOSTS.map(escapeRegex).join('|');
   return scanFilesForPattern(root, new RegExp(`(?<![A-Za-z0-9-])(?:${hosts})(?![A-Za-z0-9-])`));
 }
 
 // Matches plain and JSON-escaped (\/) slashes; covers client/ and the SSR data layer.
 function findUploadHostLeaks(releaseRoot) {
-  if (!UPLOADS_LEAK_HOST) {
-    throw new Error('UPLOADS_LEAK_HOST is not set; refusing to deploy without the uploads scan');
+  if (!DOMAIN_WP_STAGING) {
+    throw new Error('DOMAIN_WP_STAGING is not set; refusing to deploy without the uploads scan');
   }
-  const pattern = new RegExp(`${escapeRegex(UPLOADS_LEAK_HOST)}(?:\\\\?/)app(?:\\\\?/)uploads`);
+  const pattern = new RegExp(`${escapeRegex(DOMAIN_WP_STAGING)}(?:\\\\?/)app(?:\\\\?/)uploads`);
   return [
     ...scanFilesForPattern(path.join(releaseRoot, 'client'), pattern),
     ...scanFilesForPattern(path.join(releaseRoot, '.ssr/server'), pattern),
