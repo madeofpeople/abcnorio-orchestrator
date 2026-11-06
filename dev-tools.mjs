@@ -198,34 +198,31 @@ export async function readRetention() {
   return retention;
 }
 
-async function cleanupOldMediaBackups(target) {
-  const maxKeep = (await readRetention()).mediaBackups;
-  if (!fs.existsSync(MEDIA_ARCHIVE_DIR)) {
-    return;
-  }
-
-  const prefix = `abcnorio-media-${target}-`;
-  const names = fs.readdirSync(MEDIA_ARCHIVE_DIR)
-    .filter((name) => name.startsWith(prefix) && name.endsWith('.zip'));
-
-  if (names.length <= maxKeep) {
-    return;
-  }
-
-  const sortedByMtime = names
+function pruneBackups(directory, prefix, extension, maxKeep, label) {
+  const backups = fs.readdirSync(directory)
+    .filter((name) => name.startsWith(prefix) && name.endsWith(extension))
     .map((name) => {
-      const fullPath = path.join(MEDIA_ARCHIVE_DIR, name);
+      const fullPath = path.join(directory, name);
       return { name, fullPath, mtime: fs.statSync(fullPath).mtimeMs };
     })
     .sort((a, b) => b.mtime - a.mtime);
 
-  for (let i = maxKeep; i < sortedByMtime.length; i += 1) {
+  for (const backup of backups.slice(maxKeep)) {
     try {
-      fs.unlinkSync(sortedByMtime[i].fullPath);
+      fs.unlinkSync(backup.fullPath);
     } catch (error) {
-      console.warn(`[backup-media-${target}] failed to delete old archive ${sortedByMtime[i].name}: ${error.message}`);
+      console.warn(`[${label}] failed to delete old archive ${backup.name}: ${error.message}`);
     }
   }
+}
+
+function backupTimestamp() {
+  return new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15);
+}
+
+async function cleanupOldMediaBackups(target) {
+  const maxKeep = (await readRetention()).mediaBackups;
+  pruneBackups(MEDIA_ARCHIVE_DIR, `abcnorio-media-${target}-`, '.zip', maxKeep, `backup-media-${target}`);
 }
 
 export function createMediaBackupArchive(sourceDir, target) {
@@ -235,8 +232,7 @@ export function createMediaBackupArchive(sourceDir, target) {
 
   fs.mkdirSync(MEDIA_ARCHIVE_DIR, { recursive: true });
 
-  const ts = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15);
-  const archiveName = `abcnorio-media-${target}-${ts}.zip`;
+  const archiveName = `abcnorio-media-${target}-${backupTimestamp()}.zip`;
   const archivePath = path.join(MEDIA_ARCHIVE_DIR, archiveName);
   const parentDir = path.dirname(sourceDir);
   const baseName = path.basename(sourceDir);
@@ -275,26 +271,8 @@ function databaseBackupPrefix(target) {
 }
 
 async function cleanupOldDatabaseBackups(target) {
-  if (!fs.existsSync(DATABASE_ARCHIVE_DIR)) return;
-
   const maxKeep = (await readRetention()).databaseBackups;
-  const prefix = databaseBackupPrefix(target);
-  const backups = fs.readdirSync(DATABASE_ARCHIVE_DIR)
-    .filter((name) => name.startsWith(prefix) && name.endsWith('.sql'))
-    .map((name) => ({
-      name,
-      fullPath: path.join(DATABASE_ARCHIVE_DIR, name),
-      mtime: fs.statSync(path.join(DATABASE_ARCHIVE_DIR, name)).mtimeMs,
-    }))
-    .sort((a, b) => b.mtime - a.mtime);
-
-  for (const backup of backups.slice(maxKeep)) {
-    try {
-      fs.unlinkSync(backup.fullPath);
-    } catch (error) {
-      console.warn(`[backup-database-${target}] failed to delete old archive ${backup.name}: ${error.message}`);
-    }
-  }
+  pruneBackups(DATABASE_ARCHIVE_DIR, databaseBackupPrefix(target), '.sql', maxKeep, `backup-database-${target}`);
 }
 
 export function listDatabaseBackups(target) {
@@ -318,9 +296,6 @@ export function resolveDatabaseBackupArchive(requestedName, target) {
   }
 
   const archivePath = path.resolve(DATABASE_ARCHIVE_DIR, name);
-  if (!archivePath.startsWith(`${DATABASE_ARCHIVE_DIR}${path.sep}`)) {
-    throw new Error('invalid archive');
-  }
   if (!fs.existsSync(archivePath) || !fs.statSync(archivePath).isFile()) {
     throw new Error('archive not found');
   }
@@ -332,8 +307,7 @@ export function createDatabaseBackupArchive(source, target) {
   fs.mkdirSync(DATABASE_ARCHIVE_DIR, { recursive: true });
 
   const prefix = databaseBackupPrefix(target);
-  const timestamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15);
-  const archiveName = `${prefix}${timestamp}.sql`;
+  const archiveName = `${prefix}${backupTimestamp()}.sql`;
   const archivePath = path.join(DATABASE_ARCHIVE_DIR, archiveName);
   const tempPath = `${archivePath}.tmp`;
 
@@ -428,7 +402,7 @@ async function writePreservedOptions(conn, saved) {
   await runMysql(conn, [`DELETE FROM ${conn.prefix}options WHERE option_name IN (${names})`, ...inserts].join('; '));
 }
 
-export async function dumpDatabase(src, dest) {
+export async function copyDatabasePreservingOptions(src, dest) {
   const saved = await readPreservedOptions(dest);
   await copyDatabase(src, dest);
   await writePreservedOptions(dest, saved);

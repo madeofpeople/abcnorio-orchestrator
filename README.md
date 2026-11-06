@@ -51,7 +51,7 @@ deploy-orchestrator/
 
 #### **dev-tools.mjs**
 - `copyMediaFiles(src, dest)` — `fs.promises.cp()` between upload dirs
-- `dumpDatabase(src, dest)` — `mysqldump | mysql` pipe via child_process
+- `copyDatabasePreservingOptions(src, dest)` — copy a database while preserving destination-specific options
 - Dev-tools state tracking: `devToolsState`, `startDevOp()`
 
 #### **Staging Push Guardrails**
@@ -169,7 +169,7 @@ curl -X POST http://localhost:4011/restore \
 
 `npm test` runs the suite inside the orchestrator image (which has the `mysql` client), not on the host. Requires the image to be built (`docker compose up -d --build deploy-orchestrator` in abcnorio-meta).
 
-Tests use `node --test`. Coverage: archive listing, validation, path traversal rejection, deploy path validation, `dumpDatabase` error path.
+Tests use `node --test`. Coverage: archive listing, validation, path traversal rejection, deploy path validation, database copy error paths.
 
 ## Notes
 
