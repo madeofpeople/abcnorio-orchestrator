@@ -714,6 +714,26 @@ const DEV_OPS = {
       const rewritten = await normalizeUrls(STAGING_HEALTH_URL, SECRET, 'staging');
       return `Dev data pulled to staging. ${rewritten} rows.`;
     },
+    '/dev-tools/pull-from-dev-database-only': {
+      key: 'pullDBFromDevToStaging',
+      label: 'copy-database-dev-to-staging',
+      requiresDb: true,
+      run: async () => {
+        await copyDatabasePreservingOptions(db.dev, db.staging);
+        const rewritten = await normalizeUrls(STAGING_HEALTH_URL, SECRET, 'staging');
+        return `Dev database copied to staging; uploads unchanged. ${rewritten} rows.`;
+      },
+    },
+    '/dev-tools/pull-from-staging-database-only': {
+      key: 'pullFromStagingToDev',
+      label: 'copy-database-staging-to-dev',
+      requiresDb: true,
+      run: async () => {
+        await copyDatabasePreservingOptions(db.staging, db.dev);
+        const rewritten = await normalizeUrls(DEV_HEALTH_URLS[0], SECRET, 'dev');
+        return `Staging database copied to dev; uploads unchanged. ${rewritten} rows.`;
+      },
+    },
   },
   '/dev-tools/pull-from-staging': {
     key: 'pullFromStagingToDev',
@@ -1299,6 +1319,7 @@ app.post('/promote-staging', async (c) => {
       pluginVersion: recordedPluginVersion,
       webcomponentsCommitSha: stagedWebcomponentsSha,
     });
+
     if (!result.accepted) {
       productionWriteInProgress = false;
       return jsonError(c, 409, 'build_already_queued', 'a build or promotion is already queued');
@@ -1316,6 +1337,39 @@ app.post('/promote-staging', async (c) => {
   } catch (error) {
     productionWriteInProgress = false;
     return jsonError(c, 409, 'staging_commit_unavailable', error instanceof Error ? error.message : String(error));
+  }
+});
+
+app.post('/preview-staging', async (c) => {
+  if (!ALLOW_MANUAL_TRIGGER) {
+    return jsonError(c, 403, 'manual_trigger_disabled', 'manual trigger is disabled');
+  }
+  const staged = getTargetEnvStatus('staging').stagingDeployment;
+  if (!staged?.verifiedAt || !/^[a-f0-9]{40}$/i.test(staged.sourceCommitSha || '')
+    || !/^[a-f0-9]{40}$/i.test(staged.webcomponentsCommitSha || '') || !staged.pluginVersion) {
+    return jsonError(c, 409, 'staging_not_verified', 'deploy and verify staging before building its preview');
+  }
+  if (devToolsState.push.status === 'running') {
+    return jsonError(c, 409, 'staging_cutover_running', 'staging deployment is in progress');
+  }
+  try {
+    assertStagingInputs(STAGING_WORKDIR, staged);
+    if (await readStagingPluginVersion() !== staged.pluginVersion) {
+      return jsonError(c, 409, 'staging_plugin_version_changed', 'plugin changed; deploy staging again before previewing');
+    }
+    const latest = getTargetEnvStatus('staging').stagingDeployment;
+    if (latest?.releaseId !== staged.releaseId || latest?.verifiedAt !== staged.verifiedAt
+      || devToolsState.push.status === 'running') {
+      return jsonError(c, 409, 'staging_changed', 'staging changed during preview validation; retry');
+    }
+    const result = enqueueTarget('preview', 'staging-preview', 'full', staged.sourceCommitSha, {
+      pluginVersion: staged.pluginVersion,
+      webcomponentsCommitSha: staged.webcomponentsCommitSha,
+    });
+    if (!result.accepted) return jsonError(c, 409, 'build_already_queued', 'a build is already queued');
+    return jsonOk(c, 202, { status: 'queued', target: 'preview', source_commit_sha: staged.sourceCommitSha });
+  } catch (error) {
+    return jsonError(c, 409, 'staging_preview_failed', error instanceof Error ? error.message : String(error));
   }
 });
 

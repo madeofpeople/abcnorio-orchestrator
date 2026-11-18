@@ -33,7 +33,7 @@ function closeServer(server) {
   return new Promise((resolve) => server.close(resolve));
 }
 
-async function createPromotionFixture({ leakHost = null, uploadsLeak = false } = {}) {
+async function createPromotionFixture({ leakHost = null, uploadsLeak = false, recordedPluginVersion = pluginVersion } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'astro-promotion-test-'));
   const sourceRoot = path.join(root, 'source');
   const gitRoot = path.join(root, 'git');
@@ -184,7 +184,7 @@ cp -R "$TEST_EXTRACT_ROOT/." "$destination/"
           sourceCommitSha,
           webcomponentsCommitSha: webcomponentsSha,
           releaseId: 'staging-release-fixture',
-          pluginVersion,
+          pluginVersion: recordedPluginVersion,
           preparedAt: '2026-10-12T00:00:00.000Z',
           verifiedAt: '2026-10-12T00:01:00.000Z',
           deployedAt: '2026-10-12T00:01:00.000Z',
@@ -233,6 +233,30 @@ cp -R "$TEST_EXTRACT_ROOT/." "$destination/"
   throw new Error(`orchestrator did not become ready: ${stderr}`);
 }
 
+test('preview-staging queues the verified staged commit rather than working source', async (t) => {
+  const fixture = await createPromotionFixture();
+  t.after(fixture.stop);
+  const response = await fetch(fixture.healthUrl.replace('/health', '/preview-staging'), {
+    method: 'POST',
+    headers: { authorization: `Bearer ${secret}`, 'content-type': 'application/json' },
+    body: '{}',
+  });
+  assert.equal(response.status, 202, await response.clone().text());
+  assert.equal((await response.json()).data.source_commit_sha, fixture.sourceCommitSha);
+});
+
+test('preview-staging rejects a plugin changed since staging verification', async (t) => {
+  const fixture = await createPromotionFixture({ recordedPluginVersion: 'different-version' });
+  t.after(fixture.stop);
+  const response = await fetch(fixture.healthUrl.replace('/health', '/preview-staging'), {
+    method: 'POST',
+    headers: { authorization: `Bearer ${secret}`, 'content-type': 'application/json' },
+    body: '{}',
+  });
+  assert.equal(response.status, 409);
+  assert.equal((await response.json()).error.code, 'staging_plugin_version_changed');
+});
+
 test('promote-staging completes a Production promotion from verified Staging', async (t) => {
   const fixture = await createPromotionFixture();
   t.after(fixture.stop);
@@ -243,7 +267,7 @@ test('promote-staging completes a Production promotion from verified Staging', a
     headers: { ...auth, 'content-type': 'application/json' },
     body: '{}',
   });
-  assert.equal(accepted.status, 202);
+  assert.equal(accepted.status, 202, await accepted.clone().text());
   assert.equal((await accepted.json()).data.source_commit_sha, fixture.sourceCommitSha);
 
   const statusUrl = fixture.healthUrl.replace('/health', '/status');
